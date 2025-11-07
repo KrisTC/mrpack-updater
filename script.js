@@ -374,7 +374,7 @@ function renderTable(rows) {
       const dl = r.download_url ? `<a href="${r.download_url}" target="_blank" rel="noreferrer">.jar</a>` : "";
       const sourceBadge =
         r.source === "github-fallback"
-          ? `<span class="badge github-fallback" title="Found on GitHub because Modrinth had no ${escapeHtml(r.target_mc)} build">GitHub fallback</span>`
+          ? `<a class="badge github-fallback" href="https://github.com/gnembon/fabric-carpet/releases" target="_blank" rel="noreferrer" title="Found on GitHub because Modrinth had no ${escapeHtml(r.target_mc)} build">GitHub fallback</a>`
           : (r.source === "modrinth" && r.target_file_sha512)
             ? `<a class="badge modrinth" href="${escapeHtml(r.project_url)}" target="_blank" rel="noreferrer"
                  title="Open on Modrinth — included in .mrpack">Modrinth</a>`
