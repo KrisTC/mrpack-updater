@@ -5,16 +5,23 @@
   <title>mrpack → target-version checker</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
+    :root { --bar: #4f46e5; --bar-bg:#e5e7eb; }
     body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; padding: 1rem; }
     label,input,button,select { font-size: 1rem; }
-    table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+    .controls { display:flex; gap:1rem; align-items:center; flex-wrap: wrap; }
+    .muted { color:#666; }
+    h2 { margin: 1.5rem 0 .5rem; font-size: 1.2rem; }
+    table { border-collapse: collapse; margin-top: .5rem; width: 100%; }
     th, td { border: 1px solid #ddd; padding: .5rem; text-align: left; vertical-align: top; }
     th { background: #f6f6f6; }
     .ok { color: #157347; }
     .no { color: #b02a37; }
-    .muted { color: #666; }
     pre { white-space: pre-wrap; }
-    .controls { display:flex; gap:1rem; align-items:center; flex-wrap: wrap; }
+    .bar { height: 10px; background: var(--bar-bg); border-radius: 999px; overflow: hidden; margin-top:.25rem; }
+    .bar > span { display:block; height:100%; width:0%; background: var(--bar); transition: width .15s linear; }
+    .status { display:flex; align-items:center; gap:.5rem; margin-top:.5rem; }
+    .status small { color:#555; }
+    .counts { font-size:.95rem; color:#333; }
   </style>
 </head>
 <body>
@@ -37,31 +44,70 @@
         <option value="forge">forge</option>
         <option value="neoforge">neoforge</option>
       </select>
-      <span class="muted">(* resource packs auto-use loader “minecraft”)</span>
+      <span class="muted">(* resource packs & shaders use loader “minecraft”)</span>
     </div>
     <button id="run">Check</button>
   </div>
 
-  <div id="summary" class="muted" style="margin-top:.75rem;"></div>
-  <div id="table"></div>
+  <div style="margin-top:1rem;">
+    <div id="summary" class="counts muted"></div>
+    <div class="bar"><span id="bar"></span></div>
+    <div class="status">
+      <strong id="phase">Idle</strong>
+      <small id="detail"></small>
+    </div>
+  </div>
+
+  <div id="results" style="margin-top:1rem;">
+    <h2>Mods</h2>
+    <div id="mods-table"></div>
+
+    <h2>Resource Packs</h2>
+    <div id="res-table"></div>
+
+    <h2>Shaders</h2>
+    <div id="shader-table"></div>
+  </div>
+
   <details style="margin-top:1rem;">
     <summary>Raw results (debug)</summary>
     <pre id="raw"></pre>
   </details>
 
-  <!-- Local JSZip -->
   <script src="./jszip-dist/jszip.min.js"></script>
   <script>
     const MAX_CONCURRENCY = 6;
     const $ = (id) => document.getElementById(id);
+
     const fileInput = $("file");
     const runBtn = $("run");
     const mcSelect = $("mc");
     const loaderSelect = $("loader");
     const outSummary = $("summary");
     const outRaw = $("raw");
+    const bar = $("bar");
+    const phase = $("phase");
+    const detail = $("detail");
 
-    // 1) Populate MC versions dynamically
+    const modsTable = $("mods-table");
+    const resTable = $("res-table");
+    const shaderTable = $("shader-table");
+
+    function setPhase(name, extra = "") {
+      phase.textContent = name;
+      detail.textContent = extra;
+    }
+    function setBar(current, total) {
+      const pct = total ? Math.floor((current / total) * 100) : 0;
+      bar.style.width = pct + "%";
+    }
+    function resetProgress() {
+      setPhase("Idle");
+      setBar(0, 1);
+      outSummary.textContent = "";
+    }
+
+    // --- Populate MC versions dynamically ---
     (async function populateMcVersions(){
       try {
         mcSelect.disabled = true;
@@ -92,76 +138,76 @@
       }
     })();
 
-    // 2) Main flow
+    // --- Main flow ---
     runBtn.addEventListener("click", async () => {
       const file = fileInput.files?.[0];
       if (!file) { alert("Choose a .mrpack (or .zip) first."); return; }
       const TARGET_MC = mcSelect.value;
       const PACK_LOADER = loaderSelect.value;
 
-      $("table").innerHTML = "";
+      resetProgress();
+      modsTable.innerHTML = resTable.innerHTML = shaderTable.innerHTML = "";
       outRaw.textContent = "";
-      outSummary.textContent = "Reading pack…";
 
       try {
-        // Read mrpack and parse index
+        setPhase("Reading pack…");
         const zipAb = await file.arrayBuffer();
         const zip = await JSZip.loadAsync(zipAb);
         const indexFile = zip.file("modrinth.index.json");
-        if (!indexFile) { outSummary.textContent = "No modrinth.index.json found."; return; }
+        if (!indexFile) { setPhase("Error"); detail.textContent = "No modrinth.index.json"; return; }
         const index = JSON.parse(await indexFile.async("string"));
 
-        // *** NEW: current MC from pack dependencies ***
         const PACK_MC = index?.dependencies?.minecraft || "-";
 
-        // Collect SHA-1s and remember paths
+        // Collect SHA-1s + remember paths
         const sha1ToPath = new Map();
         const sha1s = [];
         for (const f of index.files || []) {
           const sha1 = f?.hashes?.sha1;
           if (sha1) { sha1s.push(sha1); sha1ToPath.set(sha1, f.path || ""); }
         }
-        if (!sha1s.length) { outSummary.textContent = "No file hashes in modrinth.index.json."; return; }
+        if (!sha1s.length) { setPhase("Done"); detail.textContent = "No file hashes in pack."; return; }
 
         outSummary.textContent = `Found ${sha1s.length} entries. Resolving projects…`;
+        setBar(1, 5);
 
-        // Hash → Version (map of sha1 to version object)
+        // Step 2: hashes -> versions
+        setPhase("Resolving versions from hashes…");
         const versionMap = await fetch("https://api.modrinth.com/v2/version_files", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ hashes: sha1s, algorithm: "sha1" })
         }).then(r => r.json());
+        setBar(2, 5);
 
-        // Collapse to unique projects (keep representative)
-        const projectEntries = new Map(); // project_id -> { anyVersion, exampleSha1 }
+        // Step 3: collapse to unique projects and detect category
+        setPhase("Collapsing to projects…");
+        const projectEntries = new Map(); // project_id -> { anyVersion, exampleSha1, category }
         for (const [sha1, ver] of Object.entries(versionMap)) {
           if (!ver || !ver.project_id) continue;
           if (!projectEntries.has(ver.project_id)) {
-            projectEntries.set(ver.project_id, { anyVersion: ver, exampleSha1: sha1 });
+            const path = sha1ToPath.get(sha1) || "";
+            const category = path.startsWith("resourcepacks/") ? "resourcepack"
+                           : path.startsWith("shaderpacks/")    ? "shaderpack"
+                           : "mod";
+            projectEntries.set(ver.project_id, { anyVersion: ver, exampleSha1: sha1, category });
           }
         }
         const projectIds = [...projectEntries.keys()];
         if (!projectIds.length) {
-          outSummary.textContent = "Couldn’t resolve any project IDs from hashes.";
-          outRaw.textContent = JSON.stringify(versionMap, null, 2);
-          return;
+          setPhase("Done"); detail.textContent = "No projects resolved."; outRaw.textContent = JSON.stringify(versionMap, null, 2); return;
         }
+        setBar(3, 5);
 
-        // Helper: detect loader ("minecraft" for resourcepacks/, else selected)
-        function loaderFor(projectId) {
-          const { exampleSha1 } = projectEntries.get(projectId) || {};
-          const path = sha1ToPath.get(exampleSha1) || "";
-          return path.startsWith("resourcepacks/") ? "minecraft" : PACK_LOADER;
+        // Helpers
+        function loaderForCategory(cat) {
+          return (cat === "resourcepack" || cat === "shaderpack") ? "minecraft" : PACK_LOADER;
         }
-
-        // Fetch project metadata (for names/slugs)
         async function getProject(projectId) {
           const r = await fetch(`https://api.modrinth.com/v2/project/${projectId}`);
           if (!r.ok) return null;
           return r.json();
         }
-
-        // Fetch filtered versions for target MC+loader, pick best
         async function getBestTargetVersion(projectId, mc, loader) {
           const url = new URL(`https://api.modrinth.com/v2/project/${projectId}/version`);
           url.searchParams.set("game_versions", JSON.stringify([mc]));
@@ -170,7 +216,6 @@
           if (!res.ok) throw new Error(`versions ${projectId}: ${res.status}`);
           const arr = await res.json();
           if (!Array.isArray(arr) || !arr.length) return null;
-
           const tier = v => v.version_type === "release" ? 3 : v.version_type === "beta" ? 2 : 1;
           arr.sort((a, b) => {
             const t = tier(b) - tier(a);
@@ -180,13 +225,15 @@
           return arr[0];
         }
 
-        // Concurrency limiter
-        async function mapLimit(items, limit, fn) {
+        async function mapLimitProgress(items, limit, fn, onTick) {
           const out = new Array(items.length);
-          let i = 0;
+          let i = 0, done = 0;
           const running = new Set();
           async function run(idx) {
-            const p = fn(items[idx]).then(v => out[idx] = v).finally(() => running.delete(p));
+            const p = fn(items[idx]).then(v => out[idx] = v).finally(() => {
+              running.delete(p);
+              done++; onTick?.(done, items.length);
+            });
             running.add(p);
             await p;
           }
@@ -197,54 +244,66 @@
           return out;
         }
 
-        outSummary.textContent = `Checking ${projectIds.length} projects for ${TARGET_MC}…`;
+        // Step 4: fetch project info + best target version, with progress
+        setPhase("Checking target availability…", `0 / ${projectIds.length}`);
+        const rows = await mapLimitProgress(
+          projectIds,
+          MAX_CONCURRENCY,
+          async (pid) => {
+            const rep = projectEntries.get(pid)?.anyVersion;
+            const cat = projectEntries.get(pid)?.category || "mod";
+            const loader = loaderForCategory(cat);
+            const [proj, best] = await Promise.all([ getProject(pid), getBestTargetVersion(pid, TARGET_MC, loader) ]);
+            return {
+              project_id: pid,
+              category: cat,
+              name: proj?.title || rep?.name || "(unknown)",
+              slug: proj?.slug,
+              current_version_number: rep?.version_number || "-",
+              current_mc: PACK_MC,
+              target_loader: loader,
+              target_available: !!best,
+              target_version_number: best?.version_number || "-",
+              target_mc: TARGET_MC,
+              target_date: best?.date_published || null,
+              download_url: best?.files?.[0]?.url || null
+            };
+          },
+          (done, total) => {
+            setPhase("Checking target availability…", `${done} / ${total}`);
+            const stepBase = 3;
+            const stepWidth = done / total;
+            setBar(stepBase + stepWidth, 5);
+          }
+        );
 
-        const rows = await mapLimit(projectIds, MAX_CONCURRENCY, async (pid) => {
-          const rep = projectEntries.get(pid)?.anyVersion;
-          const [proj, best] = await Promise.all([
-            getProject(pid),
-            getBestTargetVersion(pid, TARGET_MC, loaderFor(pid))
-          ]);
-          return {
-            project_id: pid,
-            name: proj?.title || rep?.name || "(unknown)",
-            slug: proj?.slug,
-            current_version_number: rep?.version_number || "-",
-            current_mc: PACK_MC, // <-- single value from pack dependencies
-            current_loaders: Array.isArray(rep?.loaders) ? rep.loaders.join(", ") : "-",
-            target_loader: loaderFor(pid),
-            target_available: !!best,
-            target_version_number: best?.version_number || "-",
-            target_mc: TARGET_MC,
-            target_date: best?.date_published || null,
-            download_url: best?.files?.[0]?.url || null
-          };
-        });
-
-        renderTable(rows);
-        console.table(rows.map(r => ({
-          Name: r.name,
-          "Current Mod": r.current_version_number,
-          "Current MC": r.current_mc,
-          Loader: r.target_loader,
-          ["Has " + r.target_mc]: r.target_available ? "✅" : "❌",
-          "Target Mod": r.target_version_number,
-          "Published": r.target_date ? new Date(r.target_date).toLocaleDateString() : "-",
-          Slug: r.slug
-        })));
-
+        // Step 5: render
+        setPhase("Rendering results…");
+        renderPartitionedTables(rows);
         outRaw.textContent = JSON.stringify(rows, null, 2);
-        outSummary.textContent = `Done. ${rows.filter(r => r.target_available).length}/${rows.length} have a ${TARGET_MC} build.`;
+
+        const total = rows.length;
+        const have = rows.filter(r => r.target_available).length;
+        outSummary.textContent = `Done. ${have}/${total} have a ${TARGET_MC} build.`;
+        setBar(5, 5);
+        setPhase("Done");
       } catch (err) {
         console.error(err);
-        outSummary.textContent = "Error: " + (err?.message || err);
+        setPhase("Error", err?.message || String(err));
       }
     });
 
-    function renderTable(rows) {
-      const container = document.getElementById("table");
-      if (!rows?.length) { container.innerHTML = ""; return; }
+    function renderPartitionedTables(rows) {
+      const mods = rows.filter(r => r.category === "mod");
+      const res  = rows.filter(r => r.category === "resourcepack");
+      const sh   = rows.filter(r => r.category === "shaderpack");
+      modsTable.innerHTML   = renderTable(mods);
+      resTable.innerHTML    = renderTable(res);
+      shaderTable.innerHTML = renderTable(sh);
+    }
 
+    function renderTable(rows) {
+      if (!rows?.length) return `<div class="muted">No entries.</div>`;
       const targetMc = rows[0]?.target_mc || "(target)";
       const html = [
         "<table>",
@@ -275,7 +334,7 @@
         }),
         "</tbody></table>"
       ].join("");
-      container.innerHTML = html;
+      return html;
     }
 
     function escapeHtml(s) {
