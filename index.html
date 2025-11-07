@@ -22,6 +22,9 @@
     .status { display:flex; align-items:center; gap:.5rem; margin-top:.5rem; }
     .status small { color:#555; }
     .counts { font-size:.95rem; color:#333; }
+    .badge { display:inline-block; padding:.125rem .4rem; border-radius:.45rem; font-size:.8rem; line-height:1; border:1px solid #ddd; background:#fafafa; color:#333; }
+    .badge.modrinth { border-color:#d1fae5; background:#ecfdf5; color:#065f46; }
+    .badge.github-fallback { border-color:#fde68a; background:#fffbeb; color:#92400e; }
   </style>
 </head>
 <body>
@@ -74,6 +77,7 @@
     <pre id="raw"></pre>
   </details>
 
+  <!-- Local JSZip -->
   <script src="./jszip-dist/jszip.min.js"></script>
   <script>
     const MAX_CONCURRENCY = 6;
@@ -137,6 +141,41 @@
         console.warn("Falling back to static MC version list:", e);
       }
     })();
+
+    // --- GitHub fallback for Fabric Carpet only ---
+    function escReg(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+    async function fetchCarpetGitHubRelease(targetMc, { includePrereleases = false } = {}) {
+      const res = await fetch("https://api.github.com/repos/gnembon/fabric-carpet/releases", {
+        headers: {
+          "Accept": "application/vnd.github+json",
+          "User-Agent": "kris-mrpack-checker/1.0"
+          // Optionally add Authorization for higher rate limits
+          // "Authorization": "Bearer <token>"
+        }
+      });
+      if (!res.ok) return null; // be quiet on fallback errors
+      const releases = await res.json();
+      const mcRe = new RegExp(`(^|\\b|-)${escReg(targetMc)}(\\b|-)`);
+      for (const r of releases) {
+        if (r.draft) continue;
+        if (!includePrereleases && r.prerelease) continue;
+        const asset = (r.assets || []).find(a =>
+          /\.jar$/i.test(a.name) &&
+          /fabric-?carpet/i.test(a.name) &&
+          mcRe.test(a.name)
+        );
+        if (asset) {
+          return {
+            version_number: r.tag_name || asset.name,
+            date_published: r.published_at || r.created_at || null,
+            download_url: asset.browser_download_url,
+            source: "github-fallback"
+          };
+        }
+      }
+      return null;
+    }
 
     // --- Main flow ---
     runBtn.addEventListener("click", async () => {
@@ -244,7 +283,7 @@
           return out;
         }
 
-        // Step 4: fetch project info + best target version, with progress
+        // Step 4: fetch project info + best target version, with progress (+ Carpet fallback)
         setPhase("Checking target availability…", `0 / ${projectIds.length}`);
         const rows = await mapLimitProgress(
           projectIds,
@@ -253,7 +292,21 @@
             const rep = projectEntries.get(pid)?.anyVersion;
             const cat = projectEntries.get(pid)?.category || "mod";
             const loader = loaderForCategory(cat);
-            const [proj, best] = await Promise.all([ getProject(pid), getBestTargetVersion(pid, TARGET_MC, loader) ]);
+            const [proj, bestModrinth] = await Promise.all([
+              getProject(pid),
+              getBestTargetVersion(pid, TARGET_MC, loader)
+            ]);
+
+            let best = bestModrinth;
+            let source = bestModrinth ? "modrinth" : null;
+
+            // --- Carpet fallback (ONLY if Modrinth missing) ---
+            const isCarpet = (proj?.slug === "fabric-carpet") || (pid === "TQTTVgYE");
+            if (!bestModrinth && isCarpet) {
+              const gh = await fetchCarpetGitHubRelease(TARGET_MC);
+              if (gh) { best = gh; source = "github-fallback"; }
+            }
+
             return {
               project_id: pid,
               category: cat,
@@ -266,7 +319,8 @@
               target_version_number: best?.version_number || "-",
               target_mc: TARGET_MC,
               target_date: best?.date_published || null,
-              download_url: best?.files?.[0]?.url || null
+              download_url: best?.files?.[0]?.url || best?.download_url || null,
+              source: source || "none"
             };
           },
           (done, total) => {
@@ -297,9 +351,9 @@
       const mods = rows.filter(r => r.category === "mod");
       const res  = rows.filter(r => r.category === "resourcepack");
       const sh   = rows.filter(r => r.category === "shaderpack");
-      modsTable.innerHTML   = renderTable(mods);
-      resTable.innerHTML    = renderTable(res);
-      shaderTable.innerHTML = renderTable(sh);
+      $("mods-table").innerHTML   = renderTable(mods);
+      $("res-table").innerHTML    = renderTable(res);
+      $("shader-table").innerHTML = renderTable(sh);
     }
 
     function renderTable(rows) {
@@ -314,6 +368,7 @@
         "<th>Loader</th>",
         `<th>Has ${escapeHtml(targetMc)}</th>`,
         "<th>Target mod</th>",
+        "<th>Source</th>",
         "<th>Published</th>",
         "<th>Download</th>",
         "</tr></thead><tbody>",
@@ -321,6 +376,12 @@
           const ok = r.target_available;
           const date = r.target_date ? new Date(r.target_date).toLocaleDateString() : "-";
           const dl = r.download_url ? `<a href="${r.download_url}" target="_blank" rel="noreferrer">.jar</a>` : "";
+          const sourceBadge =
+            r.source === "github-fallback"
+              ? `<span class="badge github-fallback" title="Found on GitHub because Modrinth had no ${escapeHtml(r.target_mc)} build">GitHub fallback</span>`
+              : r.source === "modrinth"
+                ? `<span class="badge modrinth" title="Found on Modrinth">Modrinth</span>`
+                : `<span class="badge" title="No match">–</span>`;
           return `<tr>
             <td>${escapeHtml(r.name || "(unknown)")}</td>
             <td>${escapeHtml(r.current_version_number)}</td>
@@ -328,6 +389,7 @@
             <td>${escapeHtml(r.target_loader || "-")}</td>
             <td class="${ok ? "ok" : "no"}">${ok ? "✅" : "❌"}</td>
             <td>${escapeHtml(r.target_version_number)}</td>
+            <td>${sourceBadge}</td>
             <td>${date}</td>
             <td>${dl}</td>
           </tr>`;
