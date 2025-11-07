@@ -66,6 +66,10 @@ function resetProgress() {
   setBar(0, 1);
   outSummary.textContent = "";
 }
+function updateTitle(packName = null) {
+  const baseTitle = "mrpack upgrader for Modrinth";
+  document.title = packName ? `${packName} - ${baseTitle}` : baseTitle;
+}
 
 /* ---------- Populate MC versions dynamically ---------- */
 (async function populateMcVersions(){
@@ -143,6 +147,7 @@ runBtn.addEventListener("click", async () => {
   LAST_SELECTED_LOADER = PACK_LOADER;
 
   resetProgress();
+  updateTitle(); // Reset title to base title
   modsTable.innerHTML = resTable.innerHTML = shaderTable.innerHTML = "";
   outRaw.textContent = "";
   buildBtn.disabled = true; dlLink.style.display = "none"; buildNote.textContent = "";
@@ -158,6 +163,9 @@ runBtn.addEventListener("click", async () => {
     const index = JSON.parse(await indexFile.async("string"));
     LAST_INDEX = index;
     LAST_PACK_NAME = index?.name || "Updated Pack";
+    
+    // Update page title with pack name
+    updateTitle(LAST_PACK_NAME);
 
     const PACK_MC = index?.dependencies?.minecraft || "-";
 
