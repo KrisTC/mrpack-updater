@@ -52,7 +52,7 @@
       <span class="muted">(* resource packs & shaders use loader “minecraft”)</span>
     </div>
     <button id="run">Check</button>
-    <!-- Moved here: build & download controls -->
+    <!-- Build & download at the top so you can see progress -->
     <button id="build" disabled>Build updated .mrpack</button>
     <a id="downloadLink" class="small" style="display:none;">Download ready</a>
     <span id="buildNote" class="small muted"></span>
@@ -111,6 +111,7 @@
     let LAST_ZIP = null;
     let LAST_TARGET_MC = "";
     let LAST_PACK_NAME = "";
+    let LAST_SELECTED_LOADER = "fabric";
     let PROJECTID_TO_ORIGFILE = new Map();
 
     function setPhase(name, extra = "") {
@@ -203,6 +204,7 @@
       if (!file) { alert("Choose a .mrpack (or .zip) first."); return; }
       const TARGET_MC = mcSelect.value;
       const PACK_LOADER = loaderSelect.value;
+      LAST_SELECTED_LOADER = PACK_LOADER;
 
       resetProgress();
       modsTable.innerHTML = resTable.innerHTML = shaderTable.innerHTML = "";
@@ -343,8 +345,19 @@
             let fmeta = null;
             if (bestModrinth) fmeta = pickPrimaryFile(bestModrinth);
 
+            // Build project URL for badge link
+            const typePath =
+              (proj?.project_type === "mod" || cat === "mod") ? "mod" :
+              (proj?.project_type === "resourcepack" || cat === "resourcepack") ? "resourcepack" :
+              (proj?.project_type === "shader" || cat === "shaderpack") ? "shader" :
+              "project";
+            const project_url = proj?.slug
+              ? `https://modrinth.com/${typePath}/${proj.slug}`
+              : `https://modrinth.com/project/${pid}`;
+
             return {
               project_id: pid,
+              project_url,
               category: cat,
               name: proj?.title || rep?.name || "(unknown)",
               slug: proj?.slug,
@@ -427,7 +440,8 @@
             r.source === "github-fallback"
               ? `<span class="badge github-fallback" title="Found on GitHub because Modrinth had no ${escapeHtml(r.target_mc)} build">GitHub fallback</span>`
               : (r.source === "modrinth" && r.target_file_sha512)
-                ? `<span class="badge modrinth" title="Modrinth match, included in .mrpack">Modrinth</span>`
+                ? `<a class="badge modrinth" href="${escapeHtml(r.project_url)}" target="_blank" rel="noreferrer"
+                     title="Open on Modrinth — included in .mrpack">Modrinth</a>`
                 : `<span class="badge" title="No match">–</span>`;
           return `<tr>
             <td>${escapeHtml(r.name || "(unknown)")}</td>
@@ -448,6 +462,26 @@
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    }
+
+    // ===== Loader version lookup (Fabric) =====
+    async function getRecommendedLoaderVersion(targetMc, loaderName) {
+      if (loaderName !== "fabric") return null; // only fabric for now
+      try {
+        setPhase("Fetching loader version…");
+        // Fabric Meta: returns array of entries with {loader:{version,stable}, ...}
+        const res = await fetch(`https://meta.fabricmc.net/v2/versions/loader/${encodeURIComponent(targetMc)}`);
+        if (!res.ok) throw new Error(`fabric meta ${res.status}`);
+        const arr = await res.json();
+        // pick first stable loader version, else first entry
+        const stable = Array.isArray(arr) ? arr.find(x => x?.loader?.stable) : null;
+        const pick = stable || (Array.isArray(arr) ? arr[0] : null);
+        const ver = pick?.loader?.version || null;
+        return ver;
+      } catch (e) {
+        console.warn("Fabric Meta lookup failed:", e);
+        return null;
+      }
     }
 
     // ===== MRPACK BUILDER (uses cached file metadata; no jar downloads) =====
@@ -489,6 +523,24 @@
         // Build new index
         const newIndex = structuredClone(LAST_INDEX);
         newIndex.dependencies = Object.assign({}, newIndex.dependencies, { minecraft: LAST_TARGET_MC });
+
+        // If selected loader is fabric, set fabric-loader to recommended version for target MC
+        let loaderNote = "";
+        if (LAST_SELECTED_LOADER === "fabric") {
+          const rec = await getRecommendedLoaderVersion(LAST_TARGET_MC, "fabric");
+          if (rec) {
+            newIndex.dependencies["fabric-loader"] = rec;
+            loaderNote = `Fabric Loader set to ${rec}.`;
+          } else {
+            // keep existing fabric-loader if any; otherwise leave unset
+            if (newIndex.dependencies["fabric-loader"]) {
+              loaderNote = `Kept existing Fabric Loader ${newIndex.dependencies["fabric-loader"]} (meta lookup failed).`;
+            } else {
+              loaderNote = `Fabric Loader not set (meta lookup failed).`;
+            }
+          }
+        }
+
         newIndex.name = `${(LAST_PACK_NAME || "Pack").replace(/\s+$/, "")} (for ${LAST_TARGET_MC})`;
         newIndex.files = fileRecords;
 
@@ -516,13 +568,14 @@
           r.target_available &&
           (r.source !== "modrinth" || !(r.target_file_sha512 && r.target_file_sha1 && r.target_file_size && r.target_file_url))
         );
+
         if (!skipped.length) {
-          buildNote.textContent = "Built from all available Modrinth versions.";
+          buildNote.textContent = `Built from all available Modrinth versions. ${loaderNote}`;
         } else {
           const names = skipped.map(r => r.name || r.slug || r.project_id).join(", ");
           buildNote.innerHTML =
             `Built pack excludes ${skipped.length} item(s) without Modrinth-downloadable metadata (e.g., GitHub fallback): ` +
-            `<span class="muted">${escapeHtml(names)}</span>`;
+            `<span class="muted">${escapeHtml(names)}</span>. ${escapeHtml(loaderNote)}`;
         }
 
         setBar(5, 5);
