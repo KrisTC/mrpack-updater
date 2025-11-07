@@ -14,14 +14,15 @@
     <button id="theme-system" class="theme-btn" title="System (follow OS)" aria-label="System theme">🖥️</button>
     <button id="theme-light" class="theme-btn" title="Light" aria-label="Light theme">☀️</button>
     <button id="theme-dark" class="theme-btn" title="Dark" aria-label="Dark theme">🌙</button>
+    <button id="help-btn" class="theme-btn" title="Help" aria-label="Help">❓</button>
   </div>
 
   <h1>Modrinth mrpack → version availability</h1>
 
   <div class="controls">
     <div>
-      <label for="file">mrpack/zip:&nbsp;</label>
-      <input type="file" id="file" accept=".mrpack,.zip" />
+      <label for="file">mrpack file:&nbsp;</label>
+      <input type="file" id="file" accept=".mrpack" />
     </div>
     
     <div class="control-row">
@@ -68,6 +69,53 @@
     <summary>Raw results (debug)</summary>
     <pre id="raw"></pre>
   </details>
+
+  <!-- Help Modal -->
+  <div id="help-modal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>How to use mrpack upgrader</h2>
+        <button id="help-close" class="modal-close" aria-label="Close help">&times;</button>
+      </div>
+      <div class="modal-body">
+        <h3>🔒 Privacy & Security</h3>
+        <p><strong>Your files never leave your browser!</strong> All processing happens locally on your device. No uploads to servers, no data collection.</p>
+        <p><strong>API Usage:</strong> The tool queries Modrinth's public API to check mod compatibility. Only minimal data is sent: file hashes (SHA1) to identify mods and version queries. No personal information or modpack contents are transmitted.</p>
+        
+        <h3>📋 How it works</h3>
+        <ol>
+          <li><strong>Upload</strong> your .mrpack file</li>
+          <li><strong>Select</strong> target Minecraft version and modloader</li>
+          <li><strong>Click "Check"</strong> to analyze mod compatibility</li>
+          <li><strong>Review</strong> which mods have updates available</li>
+          <li><strong>Download</strong> an updated .mrpack with compatible versions</li>
+        </ol>
+        
+        <h3>✅ What it does</h3>
+        <ul>
+          <li>Checks Modrinth for compatible mod versions</li>
+          <li>Shows availability for your target Minecraft version</li>
+          <li>Handles mods, resource packs, and shader packs</li>
+          <li>Falls back to GitHub for Fabric Carpet mod</li>
+          <li>Preserves all other files in your modpack (configs, overrides, etc.)</li>
+          <li>Generates updated modpacks you can download</li>
+        </ul>
+        
+        <h3>⚠️ Limitations</h3>
+        <ul>
+          <li>Only works with Modrinth .mrpack files</li>
+          <li>Primarily tested with Fabric modpacks (other loaders may work but are less tested)</li>
+          <li>Doesn't resolve mod dependencies automatically</li>
+          <li>Some mods may not be available for all MC versions</li>
+        </ul>
+        
+        <p style="margin-top: 2rem; text-align: center; color: var(--muted); font-style: italic;">
+          Hope you enjoy!<br>
+          Kris
+        </p>
+      </div>
+    </div>
+  </div>
   
   <script src="./jszip-dist/jszip.min.js"></script>
   <script src="script.js"></script>

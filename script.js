@@ -52,6 +52,33 @@ themeBtns.system.addEventListener("click", () => setThemeAttr("system"));
 themeBtns.light.addEventListener("click", () => setThemeAttr("light"));
 themeBtns.dark.addEventListener("click", () => setThemeAttr("dark"));
 
+/* ---------- HELP MODAL ---------- */
+const helpBtn = $("help-btn");
+const helpModal = $("help-modal");
+const helpClose = $("help-close");
+
+helpBtn.addEventListener("click", () => {
+  helpModal.style.display = "flex";
+});
+
+helpClose.addEventListener("click", () => {
+  helpModal.style.display = "none";
+});
+
+// Close modal when clicking outside
+helpModal.addEventListener("click", (e) => {
+  if (e.target === helpModal) {
+    helpModal.style.display = "none";
+  }
+});
+
+// Close modal with Escape key
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && helpModal.style.display === "flex") {
+    helpModal.style.display = "none";
+  }
+});
+
 /* ---------- UI helpers ---------- */
 function setPhase(name, extra = "") {
   phase.textContent = name;
@@ -141,7 +168,7 @@ function pickPrimaryFile(version) {
 /* ---------- Main flow (check) ---------- */
 runBtn.addEventListener("click", async () => {
   const file = fileInput.files?.[0];
-  if (!file) { alert("Choose a .mrpack (or .zip) first."); return; }
+  if (!file) { alert("Choose a .mrpack file first."); return; }
   const TARGET_MC = mcSelect.value;
   const PACK_LOADER = loaderSelect.value;
   LAST_SELECTED_LOADER = PACK_LOADER;
