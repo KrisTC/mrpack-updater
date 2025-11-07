@@ -1,0 +1,36 @@
+<input type="file" id="f" accept=".mrpack,.zip" />
+<script src="./jszip-dist/jszip.min.js"></script>
+<script>
+  const input = document.getElementById("f");
+  input.addEventListener("change", async () => {
+    const file = input.files[0];
+    
+    // JSZip API: load the file as ArrayBuffer
+    const arrayBuffer = await file.arrayBuffer();
+    const zip = await JSZip.loadAsync(arrayBuffer);
+    
+    // Find modrinth.index.json
+    const indexFile = zip.file("modrinth.index.json");
+    if (!indexFile) { 
+      alert("No modrinth.index.json found"); 
+      return; 
+    }
+
+    const text = await indexFile.async("string");
+    const index = JSON.parse(text);
+
+    // Collect SHA-1s (mods + resourcepacks)
+    const sha1s = index.files.map(f => f.hashes?.sha1).filter(Boolean);
+
+    console.log("SHA-1s ready for lookup:", sha1s);
+
+    // Example: batch lookup on Modrinth
+    const res = await fetch("https://api.modrinth.com/v2/version_files", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": "kris-mrpack-checker/1.0" },
+      body: JSON.stringify({ hashes: sha1s, algorithm: "sha1" })
+    });
+    const map = await res.json(); // { [sha1]: Version | Version[] | null }
+    console.log("Hash → Modrinth version:", map);
+  });
+</script>
