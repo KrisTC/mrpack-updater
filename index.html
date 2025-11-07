@@ -25,6 +25,9 @@
     .badge { display:inline-block; padding:.125rem .4rem; border-radius:.45rem; font-size:.8rem; line-height:1; border:1px solid #ddd; background:#fafafa; color:#333; }
     .badge.modrinth { border-color:#d1fae5; background:#ecfdf5; color:#065f46; }
     .badge.github-fallback { border-color:#fde68a; background:#fffbeb; color:#92400e; }
+    .builder { margin-top: 1rem; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
+    .warn { color:#92400e; }
+    .small { font-size:.9rem; }
   </style>
 </head>
 <body>
@@ -72,12 +75,17 @@
     <div id="shader-table"></div>
   </div>
 
+  <div class="builder">
+    <button id="build" disabled>Build updated .mrpack</button>
+    <a id="downloadLink" class="small" style="display:none;">Download ready</a>
+    <span id="buildNote" class="small muted"></span>
+  </div>
+
   <details style="margin-top:1rem;">
     <summary>Raw results (debug)</summary>
     <pre id="raw"></pre>
   </details>
 
-  <!-- Local JSZip -->
   <script src="./jszip-dist/jszip.min.js"></script>
   <script>
     const MAX_CONCURRENCY = 6;
@@ -85,6 +93,10 @@
 
     const fileInput = $("file");
     const runBtn = $("run");
+    const buildBtn = $("build");
+    const dlLink = $("downloadLink");
+    const buildNote = $("buildNote");
+
     const mcSelect = $("mc");
     const loaderSelect = $("loader");
     const outSummary = $("summary");
@@ -96,6 +108,13 @@
     const modsTable = $("mods-table");
     const resTable = $("res-table");
     const shaderTable = $("shader-table");
+
+    let LAST_ROWS = [];        // rows from the last check (for builder)
+    let LAST_INDEX = null;     // original modrinth.index.json
+    let LAST_ZIP = null;       // original JSZip instance
+    let LAST_TARGET_MC = "";   // target mc used
+    let LAST_PACK_NAME = "";   // original pack name
+    let PROJECTID_TO_ORIGFILE = new Map(); // project_id -> original file object (path/env/etc.)
 
     function setPhase(name, extra = "") {
       phase.textContent = name;
@@ -150,11 +169,9 @@
         headers: {
           "Accept": "application/vnd.github+json",
           "User-Agent": "kris-mrpack-checker/1.0"
-          // Optionally add Authorization for higher rate limits
-          // "Authorization": "Bearer <token>"
         }
       });
-      if (!res.ok) return null; // be quiet on fallback errors
+      if (!res.ok) return null;
       const releases = await res.json();
       const mcRe = new RegExp(`(^|\\b|-)${escReg(targetMc)}(\\b|-)`);
       for (const r of releases) {
@@ -177,7 +194,7 @@
       return null;
     }
 
-    // --- Main flow ---
+    // --- Main flow (check) ---
     runBtn.addEventListener("click", async () => {
       const file = fileInput.files?.[0];
       if (!file) { alert("Choose a .mrpack (or .zip) first."); return; }
@@ -187,23 +204,33 @@
       resetProgress();
       modsTable.innerHTML = resTable.innerHTML = shaderTable.innerHTML = "";
       outRaw.textContent = "";
+      buildBtn.disabled = true; dlLink.style.display = "none"; buildNote.textContent = "";
 
       try {
         setPhase("Reading pack…");
         const zipAb = await file.arrayBuffer();
         const zip = await JSZip.loadAsync(zipAb);
+        LAST_ZIP = zip;
+
         const indexFile = zip.file("modrinth.index.json");
         if (!indexFile) { setPhase("Error"); detail.textContent = "No modrinth.index.json"; return; }
         const index = JSON.parse(await indexFile.async("string"));
+        LAST_INDEX = index;
+        LAST_PACK_NAME = index?.name || "Updated Pack";
 
         const PACK_MC = index?.dependencies?.minecraft || "-";
 
-        // Collect SHA-1s + remember paths
+        // collect sha1s and keep a mapping to original index file entries
         const sha1ToPath = new Map();
         const sha1s = [];
+        const sha1ToFileObj = new Map();
         for (const f of index.files || []) {
           const sha1 = f?.hashes?.sha1;
-          if (sha1) { sha1s.push(sha1); sha1ToPath.set(sha1, f.path || ""); }
+          if (sha1) {
+            sha1s.push(sha1);
+            sha1ToPath.set(sha1, f.path || "");
+            sha1ToFileObj.set(sha1, f);
+          }
         }
         if (!sha1s.length) { setPhase("Done"); detail.textContent = "No file hashes in pack."; return; }
 
@@ -219,8 +246,9 @@
         }).then(r => r.json());
         setBar(2, 5);
 
-        // Step 3: collapse to unique projects and detect category
+        // Step 3: collapse to unique projects and detect category, and remember original file obj per project
         setPhase("Collapsing to projects…");
+        PROJECTID_TO_ORIGFILE = new Map();
         const projectEntries = new Map(); // project_id -> { anyVersion, exampleSha1, category }
         for (const [sha1, ver] of Object.entries(versionMap)) {
           if (!ver || !ver.project_id) continue;
@@ -230,6 +258,7 @@
                            : path.startsWith("shaderpacks/")    ? "shaderpack"
                            : "mod";
             projectEntries.set(ver.project_id, { anyVersion: ver, exampleSha1: sha1, category });
+            PROJECTID_TO_ORIGFILE.set(ver.project_id, sha1ToFileObj.get(sha1));
           }
         }
         const projectIds = [...projectEntries.keys()];
@@ -283,7 +312,7 @@
           return out;
         }
 
-        // Step 4: fetch project info + best target version, with progress (+ Carpet fallback)
+        // Step 4: fetch project info + best target version, with progress (+ Carpet fallback only if Modrinth missing)
         setPhase("Checking target availability…", `0 / ${projectIds.length}`);
         const rows = await mapLimitProgress(
           projectIds,
@@ -298,9 +327,9 @@
             ]);
 
             let best = bestModrinth;
-            let source = bestModrinth ? "modrinth" : null;
+            let source = bestModrinth ? "modrinth" : "none";
 
-            // --- Carpet fallback (ONLY if Modrinth missing) ---
+            // Carpet fallback (only if Modrinth has no target build)
             const isCarpet = (proj?.slug === "fabric-carpet") || (pid === "TQTTVgYE");
             if (!bestModrinth && isCarpet) {
               const gh = await fetchCarpetGitHubRelease(TARGET_MC);
@@ -320,7 +349,7 @@
               target_mc: TARGET_MC,
               target_date: best?.date_published || null,
               download_url: best?.files?.[0]?.url || best?.download_url || null,
-              source: source || "none"
+              source
             };
           },
           (done, total) => {
@@ -331,7 +360,7 @@
           }
         );
 
-        // Step 5: render
+        // Step 5: render & enable builder
         setPhase("Rendering results…");
         renderPartitionedTables(rows);
         outRaw.textContent = JSON.stringify(rows, null, 2);
@@ -341,6 +370,11 @@
         outSummary.textContent = `Done. ${have}/${total} have a ${TARGET_MC} build.`;
         setBar(5, 5);
         setPhase("Done");
+
+        LAST_ROWS = rows;
+        LAST_TARGET_MC = TARGET_MC;
+        buildBtn.disabled = false;
+        buildNote.textContent = "You can now build a new .mrpack from the available Modrinth results.";
       } catch (err) {
         console.error(err);
         setPhase("Error", err?.message || String(err));
@@ -401,6 +435,118 @@
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+    }
+
+    // ===== MRPACK BUILDER =====
+    buildBtn.addEventListener("click", async () => {
+      if (!LAST_ROWS.length || !LAST_INDEX || !LAST_ZIP) {
+        alert("Run a check first.");
+        return;
+      }
+
+      buildBtn.disabled = true;
+      dlLink.style.display = "none";
+      buildNote.textContent = "Building .mrpack… (fetching jars to compute hashes)";
+
+      try {
+        // Only include rows that have a target build from Modrinth (reliable CORS)
+        const includable = LAST_ROWS.filter(r => r.target_available && r.source === "modrinth" && r.download_url);
+
+        // Fetch jars, compute sha512 & sha1, and record sizes
+        const fileRecords = [];
+        let done = 0;
+        setPhase("Downloading & hashing jars…", `0 / ${includable.length}`);
+        for (const row of includable) {
+          const url = row.download_url;
+          const resp = await fetch(url);
+          if (!resp.ok) throw new Error(`Failed to fetch ${url}`);
+          const buf = await resp.arrayBuffer();
+          const size = buf.byteLength;
+          const sha512 = await digestHex("SHA-512", buf);
+          const sha1   = await digestHex("SHA-1", buf);
+
+          // Preserve original file path + env from index where possible
+          const of = PROJECTID_TO_ORIGFILE.get(row.project_id) || {};
+          const path = of.path || inferPathFromCategory(row);
+          const env  = of.env || { client: "required", server: "required" };
+
+          fileRecords.push({
+            path,
+            hashes: { sha512, sha1 },
+            env,
+            downloads: [url],
+            fileSize: size
+          });
+
+          done++; setPhase("Downloading & hashing jars…", `${done} / ${includable.length}`);
+          setBar(3 + (done / Math.max(includable.length,1)), 5); // reuse bar scale
+        }
+
+        // Build new index: clone old, bump MC, replace files
+        const newIndex = structuredClone(LAST_INDEX);
+        newIndex.dependencies = Object.assign({}, newIndex.dependencies, { minecraft: LAST_TARGET_MC });
+        newIndex.name = `${(LAST_PACK_NAME || "Pack").replace(/\s+$/, "")} (for ${LAST_TARGET_MC})`;
+        newIndex.files = fileRecords;
+
+        // Assemble new ZIP: copy overrides/ from original, add new index
+        setPhase("Packaging mrpack…");
+        const outZip = new JSZip();
+
+        // Copy overrides/ (if present) 1:1
+        const overrideEntries = Object.values(LAST_ZIP.files).filter(e => e.name.startsWith("overrides/") && !e.dir);
+        for (const e of overrideEntries) {
+          const content = await LAST_ZIP.file(e.name).async("arraybuffer");
+          outZip.file(e.name, content);
+        }
+
+        // Write modrinth.index.json
+        outZip.file("modrinth.index.json", JSON.stringify(newIndex, null, 2));
+
+        const blob = await outZip.generateAsync({ type: "blob" });
+        const fileName = `${slugify(newIndex.name)}.mrpack`;
+
+        // Download link
+        const url = URL.createObjectURL(blob);
+        dlLink.href = url;
+        dlLink.download = fileName;
+        dlLink.textContent = `Download ${fileName}`;
+        dlLink.style.display = "inline";
+        buildNote.innerHTML = buildWarningNote(LAST_ROWS);
+
+        setPhase("Done");
+      } catch (e) {
+        console.error(e);
+        buildNote.textContent = `Build failed: ${e.message || e}`;
+        setPhase("Error", e.message || String(e));
+      } finally {
+        buildBtn.disabled = false;
+      }
+    });
+
+    function buildWarningNote(rows) {
+      const skipped = rows.filter(r => r.target_available && r.source !== "modrinth");
+      if (!skipped.length) return "Built from all available Modrinth versions.";
+      const names = skipped.map(r => r.name || r.slug || r.project_id).join(", ");
+      return `Built pack excludes ${skipped.length} item(s) without Modrinth-downloadable jars (e.g. GitHub fallback): ` +
+             `<span class="warn">${escapeHtml(names)}</span>`;
+    }
+
+    function inferPathFromCategory(row) {
+      if (row.category === "resourcepack") return `resourcepacks/${(row.slug || "resourcepack")}.zip`;
+      if (row.category === "shaderpack")   return `shaderpacks/${(row.slug || "shaderpack")}.zip`;
+      return `mods/${(row.slug || "mod")}.jar`;
+    }
+
+    async function digestHex(algo, buf) {
+      const h = await crypto.subtle.digest(algo, buf);
+      return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function slugify(s) {
+      return String(s).toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80);
     }
   </script>
 </body>
