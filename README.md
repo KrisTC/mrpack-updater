@@ -11,6 +11,7 @@ This project has been refactored from a single monolithic HTML file into a clean
 - 🔍 **Version Compatibility Checking**: Upload a .mrpack file and check which mods are available for a target Minecraft version
 - 🎯 **Multi-Loader Support**: Supports Fabric, Quilt, Forge, and NeoForge modloaders
 - 📦 **Automatic Pack Building**: Generates updated .mrpack files with compatible mod versions
+- ❌ **Missing Items Tracker**: Track unavailable mods and get notified when they become available
 - 🏗️ **Special Carpet Handling**: Enhanced support for Fabric Carpet mod with GitHub fallback
 - 📊 **Detailed Reports**: Shows availability status, version numbers, and download information
 - 🎨 **Category Support**: Handles mods, resource packs, and shader packs separately
@@ -22,6 +23,7 @@ This project has been refactored from a single monolithic HTML file into a clean
 3. **Analyze**: The tool checks Modrinth API for compatible versions of each mod
 4. **Review**: See which mods have updates available and which don't
 5. **Build**: Generate a new .mrpack with all available updates
+6. **Track**: Remember missing items to get notified when unavailable mods become available
 
 ## Special Features
 
@@ -36,6 +38,13 @@ The tool includes special handling for Fabric Carpet mod:
 - Sorts by publication date for the most recent compatible version
 - Maintains original file metadata for proper pack building
 
+### Missing Items Tracker
+- Track mods that aren't available for your target Minecraft version
+- Automatic background checking for updates to unavailable mods
+- Persistent storage across browser sessions using localStorage
+- Get notifications when previously missing mods become available
+- Multi-modpack support - track missing items from different modpacks
+
 ## Usage
 
 1. Open `index.html` in a web browser
@@ -45,6 +54,8 @@ The tool includes special handling for Fabric Carpet mod:
 5. Click "Check" to analyze compatibility
 6. Review the results in the generated tables
 7. Click "Build updated .mrpack" to download an updated pack
+8. Use "Remember missing items" to track unavailable mods
+9. Click the red ❌ button to view and manage tracked missing items
 
 ## File Structure
 
