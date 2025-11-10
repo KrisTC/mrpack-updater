@@ -22,164 +22,812 @@ const modsTable = $("mods-table");
 const resTable = $("res-table");
 const shaderTable = $("shader-table");
 
-let LAST_ROWS = [];
-let LAST_INDEX = null;
-let LAST_ZIP = null;
-let LAST_TARGET_MC = "";
-let LAST_PACK_NAME = "";
-let LAST_SELECTED_LOADER = "fabric";
-let PROJECTID_TO_ORIGFILE = new Map();
+/* ---------- UTILITY FUNCTIONS ---------- */
+function parseVersion(versionStr) {
+  const parts = versionStr.split('.').map(n => parseInt(n, 10));
+  while (parts.length < 3) parts.push(0);
+  return parts;
+}
 
-/* ---------- MISSING ITEMS STORAGE ---------- */
-// Create app-specific storage prefix based on current path
-const APP_PATH = window.location.pathname.replace(/\/[^\/]*$/, '') || '/';
-const STORAGE_PREFIX = `mrpack${APP_PATH.replace(/[^a-zA-Z0-9]/g, '_')}_`;
-const MISSING_ITEMS_KEY = `${STORAGE_PREFIX}missing_items`;
-const MISSING_ITEMS_VERSION = 1;
+function compareVersions(a, b) {
+  const pa = parseVersion(a);
+  const pb = parseVersion(b);
+  for (let i = 0; i < 3; i++) {
+    if (pb[i] !== pa[i]) return pb[i] - pa[i];
+  }
+  return 0;
+}
 
-// Data structure for missing items
-// {
-//   version: 1,
-//   items: [
-//     {
-//       id: "unique-id",
-//       name: "Mod Name",
-//       category: "mod|resourcepack|shaderpack", 
-//       targetMcVersion: "1.20.4",
-//       originalModpack: "My Modpack Name",
-//       projectId: "modrinth-project-id", // if available
-//       dateAdded: "2024-11-09T12:34:56.789Z",
-//       lastChecked: "2024-11-09T12:34:56.789Z",
-//       found: false
-//     }
-//   ]
-// }
+function parseModpackNames(modpackString) {
+  return modpackString.split(', ').map(mp => mp.trim());
+}
 
-function getMissingItems() {
-  try {
-    const stored = localStorage.getItem(MISSING_ITEMS_KEY);
-    if (!stored) return { version: MISSING_ITEMS_VERSION, items: [] };
-    
-    const data = JSON.parse(stored);
-    // Handle version upgrades if needed
-    if (data.version !== MISSING_ITEMS_VERSION) {
-      return { version: MISSING_ITEMS_VERSION, items: [] };
+/* ---------- MODPACK CLASS ---------- */
+class Modpack {
+  constructor() {
+    this.reset();
+  }
+
+  reset() {
+    this.name = "";
+    this.targetMc = "";
+    this.selectedLoader = "fabric";
+    this.index = null;
+    this.zip = null;
+    this.rows = [];
+    this.projectIdToOrigFile = new Map();
+  }
+
+  setMetadata(name, targetMc, loader) {
+    this.name = name;
+    this.targetMc = targetMc;
+    this.selectedLoader = loader;
+  }
+
+  setData(index, zip, rows, projectIdToOrigFile) {
+    this.index = index;
+    this.zip = zip;
+    this.rows = rows || [];
+    this.projectIdToOrigFile = projectIdToOrigFile || new Map();
+  }
+
+  hasData() {
+    return this.rows.length > 0 && this.index && this.zip;
+  }
+
+  getMissingItems() {
+    return this.rows.filter(row => !row.target_available);
+  }
+
+  getAvailableItems() {
+    return this.rows.filter(row => row.target_available);
+  }
+
+  getSummary() {
+    const total = this.rows.length;
+    const available = this.getAvailableItems().length;
+    return { total, available, missing: total - available };
+  }
+
+  // Analysis method (moved from standalone function)
+  async analyze(file, targetMc, packLoader) {
+    setPhase("Reading pack…");
+    const zipAb = await file.arrayBuffer();
+    const zip = await JSZip.loadAsync(zipAb);
+    this.zip = zip;
+
+    const indexFile = zip.file("modrinth.index.json");
+    if (!indexFile) { setPhase("Error"); detail.textContent = "No modrinth.index.json"; return null; }
+    const index = JSON.parse(await indexFile.async("string"));
+    this.index = index;
+    this.name = index?.name || "Updated Pack";
+
+    // Update page title with pack name
+    updateTitle(this.name);
+
+    const PACK_MC = index?.dependencies?.minecraft || "-";
+
+    // collect sha1s and keep a mapping to original index file entries
+    const sha1ToPath = new Map();
+    const sha1s = [];
+    const sha1ToFileObj = new Map();
+    for (const f of index.files || []) {
+      const sha1 = f?.hashes?.sha1;
+      if (sha1) {
+        sha1s.push(sha1);
+        sha1ToPath.set(sha1, f.path || "");
+        sha1ToFileObj.set(sha1, f);
+      }
     }
-    
-    return data;
-  } catch (e) {
-    console.warn("Failed to load missing items:", e);
-    return { version: MISSING_ITEMS_VERSION, items: [] };
-  }
-}
+    if (!sha1s.length) { setPhase("Done"); detail.textContent = "No file hashes in pack."; return null; }
 
-function saveMissingItems(data) {
-  try {
-    localStorage.setItem(MISSING_ITEMS_KEY, JSON.stringify(data));
-    return true;
-  } catch (e) {
-    console.warn("Failed to save missing items:", e);
-    return false;
-  }
-}
+    outSummary.textContent = `Found ${sha1s.length} entries. Resolving projects…`;
+    setBar(1, 5);
 
-function addMissingItem(name, category, targetMcVersion, originalModpack, projectId = null) {
-  const data = getMissingItems();
-  const id = `${category}-${name}-${targetMcVersion}`.replace(/[^a-zA-Z0-9\-]/g, '-');
-  
-  // Check if already exists
-  const existing = data.items.find(item => item.id === id);
-  if (existing) {
-    // Add modpack to the list if not already present
-    const modpacks = existing.originalModpack.split(', ').map(mp => mp.trim());
-    if (!modpacks.includes(originalModpack)) {
-      modpacks.push(originalModpack);
-      existing.originalModpack = modpacks.join(', ');
-      existing.dateAdded = new Date().toISOString(); // Update date when new modpack is added
-      saveMissingItems(data);
+    // Step 2: hashes -> versions
+    setPhase("Resolving versions from hashes…");
+    const versionMap = await fetch("https://api.modrinth.com/v2/version_files", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hashes: sha1s, algorithm: "sha1" })
+    }).then(r => r.json());
+    setBar(2, 5);
+
+    // Step 3: collapse to unique projects and detect category, and remember original file obj per project
+    setPhase("Collapsing to projects…");
+    this.projectIdToOrigFile = new Map();
+    const projectEntries = new Map(); // project_id -> { anyVersion, exampleSha1, category }
+    for (const [sha1, ver] of Object.entries(versionMap)) {
+      if (!ver || !ver.project_id) continue;
+      if (!projectEntries.has(ver.project_id)) {
+        const path = sha1ToPath.get(sha1) || "";
+        const category = path.startsWith("resourcepacks/") ? "resourcepack"
+                       : path.startsWith("shaderpacks/")    ? "shaderpack"
+                       : "mod";
+        projectEntries.set(ver.project_id, { anyVersion: ver, exampleSha1: sha1, category });
+        this.projectIdToOrigFile.set(ver.project_id, sha1ToFileObj.get(sha1));
+      }
     }
-    return existing;
+    const projectIds = [...projectEntries.keys()];
+    if (!projectIds.length) {
+      setPhase("Done"); detail.textContent = "No projects resolved."; outRaw.textContent = JSON.stringify(versionMap, null, 2); return null;
+    }
+    setBar(3, 5);
+
+    // Helpers
+    function loaderForCategory(cat) {
+      return (cat === "resourcepack" || cat === "shaderpack") ? "minecraft" : packLoader;
+    }
+    async function getProject(projectId) {
+      const r = await fetch(`https://api.modrinth.com/v2/project/${projectId}`);
+      if (!r.ok) return null;
+      return r.json();
+    }
+    async function getBestTargetVersion(projectId, mc, loader) {
+      const url = new URL(`https://api.modrinth.com/v2/project/${projectId}/version`);
+      url.searchParams.set("game_versions", JSON.stringify([mc]));
+      url.searchParams.set("loaders", JSON.stringify([loader]));
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`versions ${projectId}: ${res.status}`);
+      const arr = await res.json();
+      if (!Array.isArray(arr) || !arr.length) return null;
+      const tier = v => v.version_type === "release" ? 3 : v.version_type === "beta" ? 2 : 1;
+      arr.sort((a, b) => {
+        const t = tier(b) - tier(a);
+        if (t) return t;
+        return new Date(b.date_published) - new Date(a.date_published);
+      });
+      return arr[0];
+    }
+
+    async function mapLimitProgress(items, limit, fn, onTick) {
+      const out = new Array(items.length);
+      let i = 0, done = 0;
+      const running = new Set();
+      async function run(idx) {
+        const p = fn(items[idx]).then(v => out[idx] = v).finally(() => {
+          running.delete(p);
+          done++; onTick?.(done, items.length);
+        });
+        running.add(p);
+        await p;
+      }
+      while (i < items.length) {
+        while (running.size < limit && i < items.length) await run(i++);
+        if (running.size) await Promise.race(running);
+      }
+      return out;
+    }
+
+    // Step 4: fetch project info + best target version, with progress (+ Carpet fallback only if Modrinth missing)
+    setPhase("Checking target availability…", `0 / ${projectIds.length}`);
+    const rows = await mapLimitProgress(
+      projectIds,
+      MAX_CONCURRENCY,
+      async (pid) => {
+        const rep = projectEntries.get(pid)?.anyVersion;
+        const cat = projectEntries.get(pid)?.category || "mod";
+        const loader = loaderForCategory(cat);
+        const [proj, bestModrinth] = await Promise.all([
+          getProject(pid),
+          getBestTargetVersion(pid, targetMc, loader)
+        ]);
+
+        let best = bestModrinth;
+        let source = proj ? "modrinth" : "none";
+
+        // Carpet fallback (only if Modrinth has no target build)
+        const isCarpet = (proj?.slug === "fabric-carpet") || (pid === "TQTTVgYE");
+        if (!bestModrinth && isCarpet) {
+          const gh = await fetchCarpetGitHubRelease(targetMc);
+          if (gh) { best = gh; source = "github-fallback"; }
+        }
+
+        // Cache file metadata (only for Modrinth results)
+        let fmeta = null;
+        if (bestModrinth) fmeta = pickPrimaryFile(bestModrinth);
+
+        // Build project URL for badge link
+        const typePath =
+          (proj?.project_type === "mod" || cat === "mod") ? "mod" :
+          (proj?.project_type === "resourcepack" || cat === "resourcepack") ? "resourcepack" :
+          (proj?.project_type === "shader" || cat === "shaderpack") ? "shader" :
+          "project";
+        const project_url = proj?.slug
+          ? `https://modrinth.com/${typePath}/${proj.slug}`
+          : `https://modrinth.com/project/${pid}`;
+
+        return {
+          project_id: pid,
+          project_url,
+          category: cat,
+          name: proj?.title || rep?.name || "(unknown)",
+          slug: proj?.slug,
+          current_version_number: rep?.version_number || "-",
+          current_mc: PACK_MC,
+          target_loader: loader,
+          target_available: !!best,
+          target_version_number: best?.version_number || "-",
+          target_mc: targetMc,
+          target_date: best?.date_published || null,
+          download_url: best?.files?.[0]?.url || best?.download_url || null,
+          source,
+          // cached file meta for builder
+          target_file_sha1:   fmeta?.hashes?.sha1 || null,
+          target_file_sha512: fmeta?.hashes?.sha512 || null,
+          target_file_size:   Number.isFinite(fmeta?.size) ? fmeta.size : null,
+          target_file_url:    fmeta?.url || null,
+          target_file_name:   fmeta?.filename || null
+        };
+      },
+      (done, total) => {
+        setPhase("Checking target availability…", `${done} / ${total}`);
+        const stepBase = 3;
+        const stepWidth = done / total;
+        setBar(stepBase + stepWidth, 5);
+      }
+    );
+
+    this.rows = rows;
+    this.targetMc = targetMc;
+    this.selectedLoader = packLoader;
+
+    return rows;
   }
-  
-  const item = {
-    id,
-    name,
-    category,
-    targetMcVersion,
-    originalModpack,
-    projectId,
-    dateAdded: new Date().toISOString(),
-    lastChecked: null,
-    found: false
-  };
-  
-  data.items.push(item);
-  saveMissingItems(data);
-  return item;
-}
 
-function removeMissingItem(id) {
-  const data = getMissingItems();
-  data.items = data.items.filter(item => item.id !== id);
-  saveMissingItems(data);
-}
+  // Build method (moved from buildBtn event listener)
+  async build() {
+    if (!this.hasData()) {
+      alert("Run a check first.");
+      return;
+    }
 
-function updateMissingItemStatus(id, found, lastChecked = null) {
-  const data = getMissingItems();
-  const item = data.items.find(item => item.id === id);
-  if (item) {
-    item.found = found;
-    item.lastChecked = lastChecked || new Date().toISOString();
-    saveMissingItems(data);
+    buildBtn.disabled = true;
+    dlLink.style.display = "none";
+    buildNote.textContent = "Building .mrpack…";
+    setPhase("Packaging mrpack…");
+    setBar(4, 5);
+
+    try {
+      // Only include rows with Modrinth source and cached file meta
+      const includable = this.rows.filter(r =>
+        r.target_available &&
+        r.source === "modrinth" &&
+        r.target_file_sha512 && r.target_file_sha1 &&
+        r.target_file_size && r.target_file_url
+      );
+
+      const fileRecords = [];
+      for (const row of includable) {
+        const of = this.projectIdToOrigFile.get(row.project_id) || {};
+        const path = of.path || inferPathFromCategory(row);
+        const env  = of.env || { client: "required", server: "required" };
+        fileRecords.push({
+          path,
+          hashes: { sha512: row.target_file_sha512, sha1: row.target_file_sha1 },
+          env,
+          downloads: [row.target_file_url],
+          fileSize: row.target_file_size
+        });
+      }
+
+      // Build new index
+      const newIndex = structuredClone(this.index);
+      newIndex.dependencies = Object.assign({}, newIndex.dependencies, { minecraft: this.targetMc });
+
+      // If selected loader is fabric, set fabric-loader to recommended version for target MC
+      let loaderNote = "";
+      if (this.selectedLoader === "fabric") {
+        const rec = await getRecommendedLoaderVersion(this.targetMc, "fabric");
+        if (rec) {
+          newIndex.dependencies["fabric-loader"] = rec;
+          loaderNote = `Fabric Loader set to ${rec}.`;
+        } else {
+          if (newIndex.dependencies["fabric-loader"]) {
+            loaderNote = `Kept existing Fabric Loader ${newIndex.dependencies["fabric-loader"]} (meta lookup failed).`;
+          } else {
+            loaderNote = `Fabric Loader not set (meta lookup failed).`;
+          }
+        }
+      }
+
+      newIndex.name = `${(this.name || "Pack").replace(/\s+$/, "")} (for ${this.targetMc})`;
+      newIndex.files = fileRecords;
+
+      // Package: copy overrides/ + write index
+      const outZip = new JSZip();
+
+      const overrideEntries = Object.values(this.zip.files).filter(e => e.name.startsWith("overrides/") && !e.dir);
+      for (const e of overrideEntries) {
+        const content = await this.zip.file(e.name).async("arraybuffer");
+        outZip.file(e.name, content);
+      }
+      outZip.file("modrinth.index.json", JSON.stringify(newIndex, null, 2));
+
+      const blob = await outZip.generateAsync({ type: "blob" });
+      const fileName = `${slugify(newIndex.name)}.mrpack`;
+
+      const url = URL.createObjectURL(blob);
+      dlLink.href = url;
+      dlLink.download = fileName;
+      dlLink.textContent = `Download ${fileName}`;
+      dlLink.style.display = "inline";
+
+      // Warn about excluded rows (GitHub fallback / missing meta)
+      const skipped = this.rows.filter(r =>
+        r.target_available &&
+        (r.source !== "modrinth" || !(r.target_file_sha512 && r.target_file_sha1 && r.target_file_size && r.target_file_url))
+      );
+
+      if (!skipped.length) {
+        buildNote.textContent = `Built from all available Modrinth versions. ${loaderNote}`;
+      } else {
+        const names = skipped.map(r => r.name || r.slug || r.project_id).join(", ");
+        buildNote.innerHTML =
+          `Built pack excludes ${skipped.length} item(s) without Modrinth-downloadable metadata (e.g., GitHub fallback): ` +
+          `<span class="muted">${escapeHtml(names)}</span>. ${escapeHtml(loaderNote)}`;
+      }
+
+      setBar(5, 5);
+      setPhase("Done");
+    } catch (e) {
+      console.error(e);
+      buildNote.textContent = `Build failed: ${e.message || e}`;
+      setPhase("Error", e.message || String(e));
+    } finally {
+      buildBtn.disabled = false;
+    }
   }
 }
 
-function clearMissingItems() {
-  saveMissingItems({ version: MISSING_ITEMS_VERSION, items: [] });
+// Create global instance
+const currentModpack = new Modpack();
+
+/* ---------- RESULTS TABLE CLASS ---------- */
+class ResultsTable {
+  constructor() {
+    this.modsTable = $("mods-table");
+    this.resTable = $("res-table");
+    this.shaderTable = $("shader-table");
+  }
+
+  clear() {
+    this.modsTable.innerHTML = "";
+    this.resTable.innerHTML = "";
+    this.shaderTable.innerHTML = "";
+  }
+
+  render(rows) {
+    const mods = rows.filter(r => r.category === "mod");
+    const res  = rows.filter(r => r.category === "resourcepack");
+    const sh   = rows.filter(r => r.category === "shaderpack");
+
+    this.modsTable.innerHTML   = this.renderTable(mods);
+    this.resTable.innerHTML    = this.renderTable(res);
+    this.shaderTable.innerHTML = this.renderTable(sh);
+  }
+
+  renderTable(rows) {
+    if (!rows?.length) return `<div class="muted">No entries.</div>`;
+
+    // Sort by availability (unavailable first), then alphabetically by name
+    const sortedRows = [...rows].sort((a, b) => {
+      // First sort by availability (false before true, so unavailable comes first)
+      if (a.target_available !== b.target_available) {
+        return a.target_available - b.target_available;
+      }
+      // Then sort alphabetically by name
+      const nameA = (a.name || "(unknown)").toLowerCase();
+      const nameB = (b.name || "(unknown)").toLowerCase();
+      return nameA.localeCompare(nameB);
+    });
+
+    const targetMc = rows[0]?.target_mc || "(target)";
+    const html = [
+      "<table>",
+      "<thead><tr>",
+      "<th>Name</th>",
+      "<th>Current mod</th>",
+      "<th>Current MC</th>",
+      "<th>Loader</th>",
+      `<th>Has ${escapeHtml(targetMc)}</th>`,
+      "<th>Target mod</th>",
+      "<th>Source</th>",
+      "<th>Published</th>",
+      "<th>Download</th>",
+      "</tr></thead><tbody>",
+      ...sortedRows.map(r => {
+        const ok = r.target_available;
+        const date = r.target_date ? new Date(r.target_date).toLocaleDateString() : "-";
+        const dl = r.download_url ? `<a href="${r.download_url}" target="_blank" rel="noreferrer">.jar</a>` : "";
+        const sourceBadge =
+          r.source === "github-fallback"
+            ? `<a class="badge github-fallback" href="https://github.com/gnembon/fabric-carpet/releases" target="_blank" rel="noreferrer" title="Found on GitHub because Modrinth had no ${escapeHtml(r.target_mc)} build">GitHub fallback</a>`
+            : r.source === "modrinth"
+              ? `<a class="badge modrinth" href="${escapeHtml(r.project_url)}" target="_blank" rel="noreferrer"
+                   title="Open on Modrinth${r.target_file_sha512 ? ' — included in .mrpack' : ''}">Modrinth</a>`
+              : `<span class="badge" title="No match">–</span>`;
+        return `<tr>
+          <td>${escapeHtml(r.name || "(unknown)")}</td>
+          <td>${escapeHtml(r.current_version_number)}</td>
+          <td>${escapeHtml(r.current_mc)}</td>
+          <td>${escapeHtml(r.target_loader || "-")}</td>
+          <td class="${ok ? "ok" : "no"}">${ok ? "✅" : "❌"}</td>
+          <td>${escapeHtml(r.target_version_number)}</td>
+          <td>${sourceBadge}</td>
+          <td>${date}</td>
+          <td>${dl}</td>
+        </tr>`;
+      }),
+      "</tbody></table>"
+    ].join("");
+    return html;
+  }
+
+  updateSummary(rows, targetMc) {
+    const total = rows.length;
+    const have = rows.filter(r => r.target_available).length;
+    outSummary.textContent = `Done. ${have}/${total} have a ${targetMc} build.`;
+  }
 }
 
-function removeMissingItemFromModpack(id, modpackName) {
-  const data = getMissingItems();
-  const item = data.items.find(item => item.id === id);
-  if (item) {
-    const modpacks = item.originalModpack.split(', ').map(mp => mp.trim());
-    const updatedModpacks = modpacks.filter(mp => mp !== modpackName);
-    
-    if (updatedModpacks.length === 0) {
-      // Remove the entire item if no modpacks reference it
-      data.items = data.items.filter(item => item.id !== id);
+// Create global instance
+const resultsTable = new ResultsTable();
+
+/* ---------- MISSING ITEMS MANAGER ---------- */
+class MissingItemsManager {
+  constructor() {
+    // Create app-specific storage prefix based on current path
+    const APP_PATH = window.location.pathname.replace(/\/[^\/]*$/, '') || '/';
+    this.STORAGE_PREFIX = `mrpack${APP_PATH.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+    this.MISSING_ITEMS_KEY = `${this.STORAGE_PREFIX}missing_items`;
+    this.MISSING_ITEMS_VERSION = 1;
+    this.isCheckingMissingItems = false;
+  }
+
+  // Storage operations
+  getMissingItems() {
+    try {
+      const stored = localStorage.getItem(this.MISSING_ITEMS_KEY);
+      if (!stored) return { version: this.MISSING_ITEMS_VERSION, items: [] };
+
+      const data = JSON.parse(stored);
+      // Handle version upgrades if needed
+      if (data.version !== this.MISSING_ITEMS_VERSION) {
+        return { version: this.MISSING_ITEMS_VERSION, items: [] };
+      }
+
+      return data;
+    } catch (e) {
+      console.warn("Failed to load missing items:", e);
+      return { version: this.MISSING_ITEMS_VERSION, items: [] };
+    }
+  }
+
+  saveMissingItems(data) {
+    try {
+      localStorage.setItem(this.MISSING_ITEMS_KEY, JSON.stringify(data));
+      return true;
+    } catch (e) {
+      console.warn("Failed to save missing items:", e);
+      return false;
+    }
+  }
+
+  // Data manipulation
+  addMissingItem(name, category, targetMcVersion, originalModpack, projectId = null) {
+    const data = this.getMissingItems();
+    const id = `${category}-${name}-${targetMcVersion}`.replace(/[^a-zA-Z0-9\-]/g, '-');
+
+    // Check if already exists
+    const existing = data.items.find(item => item.id === id);
+    if (existing) {
+      // Add modpack to the list if not already present
+      const modpacks = parseModpackNames(existing.originalModpack);
+      if (!modpacks.includes(originalModpack)) {
+        modpacks.push(originalModpack);
+        existing.originalModpack = modpacks.join(', ');
+        existing.dateAdded = new Date().toISOString(); // Update date when new modpack is added
+        this.saveMissingItems(data);
+      }
+      return existing;
+    }
+
+    const item = {
+      id,
+      name,
+      category,
+      targetMcVersion,
+      originalModpack,
+      projectId,
+      dateAdded: new Date().toISOString(),
+      lastChecked: null,
+      found: false
+    };
+
+    data.items.push(item);
+    this.saveMissingItems(data);
+    return item;
+  }
+
+  removeMissingItem(id) {
+    const data = this.getMissingItems();
+    data.items = data.items.filter(item => item.id !== id);
+    this.saveMissingItems(data);
+  }
+
+  updateMissingItemStatus(id, found, lastChecked = null) {
+    const data = this.getMissingItems();
+    const item = data.items.find(item => item.id === id);
+    if (item) {
+      item.found = found;
+      item.lastChecked = lastChecked || new Date().toISOString();
+      this.saveMissingItems(data);
+    }
+  }
+
+  clearMissingItems() {
+    this.saveMissingItems({ version: this.MISSING_ITEMS_VERSION, items: [] });
+  }
+
+  removeMissingItemFromModpack(id, modpackName) {
+    const data = this.getMissingItems();
+    const item = data.items.find(item => item.id === id);
+    if (item) {
+      const modpacks = parseModpackNames(item.originalModpack);
+      const updatedModpacks = modpacks.filter(mp => mp !== modpackName);
+
+      if (updatedModpacks.length === 0) {
+        // Remove the entire item if no modpacks reference it
+        data.items = data.items.filter(item => item.id !== id);
+      } else {
+        // Update the modpack list
+        item.originalModpack = updatedModpacks.join(', ');
+      }
+      this.saveMissingItems(data);
+    }
+  }
+
+  // UI rendering
+  renderMissingItems() {
+    const data = this.getMissingItems();
+    const items = data.items || [];
+
+    if (items.length === 0) {
+      missingItemsList.innerHTML = '<p class="muted">No missing items tracked yet. Use "Remember missing items" when building modpacks to track unavailable mods.</p>';
+      return;
+    }
+
+    // Sort by found status (found items first), then alphabetically by name
+    const sortedItems = [...items].sort((a, b) => {
+      // First sort by found status (found before not found)
+      if (a.found !== b.found) {
+        return b.found - a.found; // true (1) comes before false (0)
+      }
+      // Then sort alphabetically by name
+      const nameA = (a.name || "(unknown)").toLowerCase();
+      const nameB = (b.name || "(unknown)").toLowerCase();
+      return nameA.localeCompare(nameB);
+    });
+
+    const html = sortedItems.map(item => {
+      const statusClass = item.found ? 'found' : 'not-found';
+      const statusText = item.found ? '✅ Found' : '❌ Still missing';
+      const lastChecked = item.lastChecked
+        ? new Date(item.lastChecked).toLocaleString()
+        : 'Never checked';
+
+      // Build view on Modrinth URL if we have project ID
+      const modrinthUrl = item.projectId ? `https://modrinth.com/project/${item.projectId}` : null;
+      const viewButton = modrinthUrl
+        ? `<button class="missing-item-view" onclick="window.open('${modrinthUrl}', '_blank')">View on Modrinth</button>`
+        : '';
+
+      return `
+        <div class="missing-item">
+          <div class="missing-item-header">
+            <h4 class="missing-item-name">
+              ${escapeHtml(item.name)}
+              <span class="missing-item-mc">${escapeHtml(item.targetMcVersion)}</span>
+            </h4>
+            <span class="missing-item-status ${statusClass}">${statusText}</span>
+          </div>
+          <div class="missing-item-details">
+            <div><strong>Category:</strong> ${escapeHtml(item.category)} | <strong>Added:</strong> ${new Date(item.dateAdded).toLocaleString()}</div>
+            <div><strong>From modpack:</strong> ${escapeHtml(item.originalModpack)}</div>
+          </div>
+          <div class="missing-item-actions">
+            ${viewButton}
+            <button class="missing-item-remove" onclick="removeMissingItemUI('${item.id}')">Remove</button>
+            <span class="missing-item-lastcheck"><strong>Last checked:</strong> ${lastChecked}</span>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    missingItemsList.innerHTML = html;
+  }
+
+  removeMissingItemUI(id) {
+    this.removeMissingItem(id);
+    this.renderMissingItems();
+    this.updateMissingItemsButtonTitle();
+    showNotification("Missing item removed.");
+  }
+
+  // Update checking
+  async checkMissingItemsForUpdates() {
+    if (this.isCheckingMissingItems) return;
+
+    const data = this.getMissingItems();
+    const items = data.items || [];
+
+    if (items.length === 0) {
+      showNotification("No missing items to check.");
+      return;
+    }
+
+    this.isCheckingMissingItems = true;
+    missingItemsBtn.classList.add('checking');
+    checkMissingItemsBtn.disabled = true;
+    missingItemsStatus.textContent = "Checking for updates...";
+
+    let foundCount = 0;
+    let checkedCount = 0;
+
+    try {
+      // Check each missing item
+      for (const item of items) {
+        missingItemsStatus.textContent = `Checking ${checkedCount + 1}/${items.length}: ${item.name}`;
+
+        let found = false;
+
+        if (item.projectId) {
+          // If we have a project ID, check Modrinth directly
+          try {
+            const loader = item.category === "mod" ? "fabric" : "minecraft"; // Default to fabric for mods
+            const url = new URL(`https://api.modrinth.com/v2/project/${item.projectId}/version`);
+            url.searchParams.set("game_versions", JSON.stringify([item.targetMcVersion]));
+            url.searchParams.set("loaders", JSON.stringify([loader]));
+
+            const res = await fetch(url);
+            if (res.ok) {
+              const versions = await res.json();
+              found = Array.isArray(versions) && versions.length > 0;
+            }
+          } catch (e) {
+            console.warn(`Failed to check project ${item.projectId}:`, e);
+          }
+        } else {
+          // If no project ID, try to search by name
+          try {
+            const searchUrl = new URL("https://api.modrinth.com/v2/search");
+            searchUrl.searchParams.set("query", item.name);
+            searchUrl.searchParams.set("limit", "10");
+
+            const searchRes = await fetch(searchUrl);
+            if (searchRes.ok) {
+              const searchData = await searchRes.json();
+              const hits = searchData.hits || [];
+
+              // Look for exact or close name matches
+              for (const hit of hits) {
+                if (hit.title.toLowerCase().includes(item.name.toLowerCase()) ||
+                    item.name.toLowerCase().includes(hit.title.toLowerCase())) {
+                  // Check if this project has versions for our target MC
+                  try {
+                    const loader = item.category === "mod" ? "fabric" : "minecraft";
+                    const versionUrl = new URL(`https://api.modrinth.com/v2/project/${hit.project_id}/version`);
+                    versionUrl.searchParams.set("game_versions", JSON.stringify([item.targetMcVersion]));
+                    versionUrl.searchParams.set("loaders", JSON.stringify([loader]));
+
+                    const versionRes = await fetch(versionUrl);
+                    if (versionRes.ok) {
+                      const versions = await versionRes.json();
+                      if (Array.isArray(versions) && versions.length > 0) {
+                        found = true;
+                        break;
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`Failed to check versions for ${hit.project_id}:`, e);
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.warn(`Failed to search for ${item.name}:`, e);
+          }
+        }
+
+        this.updateMissingItemStatus(item.id, found);
+        if (found) foundCount++;
+        checkedCount++;
+
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      // Update UI
+      this.renderMissingItems();
+
+      if (foundCount > 0) {
+        const foundItems = items.filter(item => {
+          const updated = this.getMissingItems().items.find(i => i.id === item.id);
+          return updated && updated.found;
+        }).map(item => `${item.name} (${item.originalModpack})`);
+
+        showNotification(`🎉 Found ${foundCount} missing item(s)! Check these modpacks: ${foundItems.join(', ')}`);
+      } else {
+        showNotification("No updates found for missing items.");
+      }
+
+      missingItemsStatus.textContent = `Last checked: ${new Date().toLocaleString()}`;
+
+    } catch (e) {
+      console.error("Error checking missing items:", e);
+      missingItemsStatus.textContent = "Error checking for updates.";
+      showNotification("Error occurred while checking for updates.");
+    } finally {
+      this.isCheckingMissingItems = false;
+      missingItemsBtn.classList.remove('checking');
+      checkMissingItemsBtn.disabled = false;
+    }
+  }
+
+  updateMissingItemsButtonTitle() {
+    const data = this.getMissingItems();
+    const count = data.items ? data.items.length : 0;
+
+    if (count > 0) {
+      missingItemsBtn.title = `Missing Items Tracker (${count} tracked)`;
     } else {
-      // Update the modpack list
-      item.originalModpack = updatedModpacks.join(', ');
+      missingItemsBtn.title = "Missing Items Tracker";
     }
-    saveMissingItems(data);
   }
 }
 
-/* ---------- THEME LOGIC (working) ---------- */
-const THEME_KEY = `${STORAGE_PREFIX}theme`;
-const themeBtns = {
-  system: $("theme-system"),
-  light: $("theme-light"),
-  dark: $("theme-dark"),
-};
+// Create global instance
+const missingItemsManager = new MissingItemsManager();
 
-function setThemeAttr(val) {
-  document.documentElement.setAttribute("data-theme", val);
-  localStorage.setItem(THEME_KEY, val);
-  // update active styles
-  Object.keys(themeBtns).forEach(k => themeBtns[k].classList.toggle("active", k === val));
+/* ---------- THEME MANAGER ---------- */
+class ThemeManager {
+  constructor() {
+    // Create app-specific storage prefix based on current path
+    const APP_PATH = window.location.pathname.replace(/\/[^\/]*$/, '') || '/';
+    const STORAGE_PREFIX = `mrpack${APP_PATH.replace(/[^a-zA-Z0-9]/g, '_')}_`;
+    this.THEME_KEY = `${STORAGE_PREFIX}theme`;
+
+    this.themeBtns = {
+      system: $("theme-system"),
+      light: $("theme-light"),
+      dark: $("theme-dark"),
+    };
+
+    this.init();
+  }
+
+  setThemeAttr(val) {
+    document.documentElement.setAttribute("data-theme", val);
+    localStorage.setItem(this.THEME_KEY, val);
+    // update active styles
+    Object.keys(this.themeBtns).forEach(k => this.themeBtns[k].classList.toggle("active", k === val));
+  }
+
+  init() {
+    const saved = localStorage.getItem(this.THEME_KEY) || "system";
+    this.setThemeAttr(saved);
+    // If user switches OS theme later and we're on "system", CSS updates automatically via media query
+
+    // Set up event listeners
+    this.themeBtns.system.addEventListener("click", () => this.setThemeAttr("system"));
+    this.themeBtns.light.addEventListener("click", () => this.setThemeAttr("light"));
+    this.themeBtns.dark.addEventListener("click", () => this.setThemeAttr("dark"));
+  }
 }
 
-(function initTheme() {
-  const saved = localStorage.getItem(THEME_KEY) || "system";
-  setThemeAttr(saved);
-  // If user switches OS theme later and we're on "system", CSS updates automatically via media query
-})();
-
-themeBtns.system.addEventListener("click", () => setThemeAttr("system"));
-themeBtns.light.addEventListener("click", () => setThemeAttr("light"));
-themeBtns.dark.addEventListener("click", () => setThemeAttr("dark"));
+// Create global instance
+const themeManager = new ThemeManager();
 
 /* ---------- FILE INPUT HANDLER ---------- */
 fileInput.addEventListener("change", (e) => {
@@ -210,8 +858,6 @@ const notificationToast = $("notification-toast");
 const notificationText = $("notification-text");
 const notificationClose = $("notification-close");
 
-let isCheckingMissingItems = false;
-
 helpBtn.addEventListener("click", () => {
   helpModal.style.display = "flex";
 });
@@ -230,7 +876,7 @@ helpModal.addEventListener("click", (e) => {
 /* ---------- MISSING ITEMS PANEL HANDLERS ---------- */
 missingItemsBtn.addEventListener("click", () => {
   missingItemsPanel.style.display = "flex";
-  renderMissingItems();
+  missingItemsManager.renderMissingItems();
 });
 
 missingItemsClose.addEventListener("click", () => {
@@ -244,16 +890,14 @@ missingItemsPanel.addEventListener("click", (e) => {
 });
 
 checkMissingItemsBtn.addEventListener("click", () => {
-  if (!isCheckingMissingItems) {
-    checkMissingItemsForUpdates();
-  }
+  missingItemsManager.checkMissingItemsForUpdates();
 });
 
 clearMissingItemsBtn.addEventListener("click", () => {
   if (confirm("Are you sure you want to clear all missing items? This cannot be undone.")) {
-    clearMissingItems();
-    renderMissingItems();
-    updateMissingItemsButtonTitle();
+    missingItemsManager.clearMissingItems();
+    missingItemsManager.renderMissingItems();
+    missingItemsManager.updateMissingItemsButtonTitle();
     showNotification("All missing items cleared.");
   }
 });
@@ -276,7 +920,7 @@ function showNotification(message) {
     if (e.target !== notificationClose) {
       hideNotification();
       missingItemsPanel.style.display = "flex";
-      renderMissingItems();
+      missingItemsManager.renderMissingItems();
     }
   };
   
@@ -339,14 +983,7 @@ function updateTitle(packName = null) {
       .map(t => t.version || t)
       .filter(v => /^\d+\.\d+(\.\d+)?$/.test(v));
 
-    clean.sort((a, b) => {
-      const pa = a.split('.').map(n=>parseInt(n,10));
-      const pb = b.split('.').map(n=>parseInt(n,10));
-      while (pa.length < 3) pa.push(0);
-      while (pb.length < 3) pb.push(0);
-      for (let i=0;i<3;i++){ if (pb[i] !== pa[i]) return pb[i]-pa[i]; }
-      return 0;
-    });
+    clean.sort((a, b) => compareVersions(a, b));
 
     mcSelect.innerHTML = clean.map(v => `<option value="${v}">${v}</option>`).join("");
     mcSelect.disabled = false;
@@ -393,224 +1030,46 @@ function pickPrimaryFile(version) {
   return version.files.find(f => f.primary) || version.files[0];
 }
 
+/* ---------- Main flow functions ---------- */
+
 /* ---------- Main flow (check) ---------- */
 runBtn.addEventListener("click", async () => {
   const file = fileInput.files?.[0];
   if (!file) { alert("Choose a .mrpack file first."); return; }
   const TARGET_MC = mcSelect.value;
   const PACK_LOADER = loaderSelect.value;
-  LAST_SELECTED_LOADER = PACK_LOADER;
 
   resetProgress();
   updateTitle(); // Reset title to base title
-  modsTable.innerHTML = resTable.innerHTML = shaderTable.innerHTML = "";
+  resultsTable.clear();
   outRaw.textContent = "";
   buildControls.style.display = "none";
-  buildBtn.disabled = true; 
+  buildBtn.disabled = true;
   captureMissingBtn.disabled = true;
   captureMissingBtn.style.display = "none";
-  dlLink.style.display = "none"; 
+  dlLink.style.display = "none";
   buildNote.textContent = "";
 
   try {
-    setPhase("Reading pack…");
-    const zipAb = await file.arrayBuffer();
-    const zip = await JSZip.loadAsync(zipAb);
-    LAST_ZIP = zip;
+    // Step 1-4: Analyze modpack compatibility
+    const rows = await currentModpack.analyze(file, TARGET_MC, PACK_LOADER);
+    if (!rows) return; // Error occurred during analysis
 
-    const indexFile = zip.file("modrinth.index.json");
-    if (!indexFile) { setPhase("Error"); detail.textContent = "No modrinth.index.json"; return; }
-    const index = JSON.parse(await indexFile.async("string"));
-    LAST_INDEX = index;
-    LAST_PACK_NAME = index?.name || "Updated Pack";
-    
-    // Update page title with pack name
-    updateTitle(LAST_PACK_NAME);
-
-    const PACK_MC = index?.dependencies?.minecraft || "-";
-
-    // collect sha1s and keep a mapping to original index file entries
-    const sha1ToPath = new Map();
-    const sha1s = [];
-    const sha1ToFileObj = new Map();
-    for (const f of index.files || []) {
-      const sha1 = f?.hashes?.sha1;
-      if (sha1) {
-        sha1s.push(sha1);
-        sha1ToPath.set(sha1, f.path || "");
-        sha1ToFileObj.set(sha1, f);
-      }
-    }
-    if (!sha1s.length) { setPhase("Done"); detail.textContent = "No file hashes in pack."; return; }
-
-    outSummary.textContent = `Found ${sha1s.length} entries. Resolving projects…`;
-    setBar(1, 5);
-
-    // Step 2: hashes -> versions
-    setPhase("Resolving versions from hashes…");
-    const versionMap = await fetch("https://api.modrinth.com/v2/version_files", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hashes: sha1s, algorithm: "sha1" })
-    }).then(r => r.json());
-    setBar(2, 5);
-
-    // Step 3: collapse to unique projects and detect category, and remember original file obj per project
-    setPhase("Collapsing to projects…");
-    PROJECTID_TO_ORIGFILE = new Map();
-    const projectEntries = new Map(); // project_id -> { anyVersion, exampleSha1, category }
-    for (const [sha1, ver] of Object.entries(versionMap)) {
-      if (!ver || !ver.project_id) continue;
-      if (!projectEntries.has(ver.project_id)) {
-        const path = sha1ToPath.get(sha1) || "";
-        const category = path.startsWith("resourcepacks/") ? "resourcepack"
-                       : path.startsWith("shaderpacks/")    ? "shaderpack"
-                       : "mod";
-        projectEntries.set(ver.project_id, { anyVersion: ver, exampleSha1: sha1, category });
-        PROJECTID_TO_ORIGFILE.set(ver.project_id, sha1ToFileObj.get(sha1));
-      }
-    }
-    const projectIds = [...projectEntries.keys()];
-    if (!projectIds.length) {
-      setPhase("Done"); detail.textContent = "No projects resolved."; outRaw.textContent = JSON.stringify(versionMap, null, 2); return;
-    }
-    setBar(3, 5);
-
-    // Helpers
-    function loaderForCategory(cat) {
-      return (cat === "resourcepack" || cat === "shaderpack") ? "minecraft" : PACK_LOADER;
-    }
-    async function getProject(projectId) {
-      const r = await fetch(`https://api.modrinth.com/v2/project/${projectId}`);
-      if (!r.ok) return null;
-      return r.json();
-    }
-    async function getBestTargetVersion(projectId, mc, loader) {
-      const url = new URL(`https://api.modrinth.com/v2/project/${projectId}/version`);
-      url.searchParams.set("game_versions", JSON.stringify([mc]));
-      url.searchParams.set("loaders", JSON.stringify([loader]));
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`versions ${projectId}: ${res.status}`);
-      const arr = await res.json();
-      if (!Array.isArray(arr) || !arr.length) return null;
-      const tier = v => v.version_type === "release" ? 3 : v.version_type === "beta" ? 2 : 1;
-      arr.sort((a, b) => {
-        const t = tier(b) - tier(a);
-        if (t) return t;
-        return new Date(b.date_published) - new Date(a.date_published);
-      });
-      return arr[0];
-    }
-
-    async function mapLimitProgress(items, limit, fn, onTick) {
-      const out = new Array(items.length);
-      let i = 0, done = 0;
-      const running = new Set();
-      async function run(idx) {
-        const p = fn(items[idx]).then(v => out[idx] = v).finally(() => {
-          running.delete(p);
-          done++; onTick?.(done, items.length);
-        });
-        running.add(p);
-        await p;
-      }
-      while (i < items.length) {
-        while (running.size < limit && i < items.length) await run(i++);
-        if (running.size) await Promise.race(running);
-      }
-      return out;
-    }
-
-    // Step 4: fetch project info + best target version, with progress (+ Carpet fallback only if Modrinth missing)
-    setPhase("Checking target availability…", `0 / ${projectIds.length}`);
-    const rows = await mapLimitProgress(
-      projectIds,
-      MAX_CONCURRENCY,
-      async (pid) => {
-        const rep = projectEntries.get(pid)?.anyVersion;
-        const cat = projectEntries.get(pid)?.category || "mod";
-        const loader = loaderForCategory(cat);
-        const [proj, bestModrinth] = await Promise.all([
-          getProject(pid),
-          getBestTargetVersion(pid, TARGET_MC, loader)
-        ]);
-
-        let best = bestModrinth;
-        let source = proj ? "modrinth" : "none";
-
-        // Carpet fallback (only if Modrinth has no target build)
-        const isCarpet = (proj?.slug === "fabric-carpet") || (pid === "TQTTVgYE");
-        if (!bestModrinth && isCarpet) {
-          const gh = await fetchCarpetGitHubRelease(TARGET_MC);
-          if (gh) { best = gh; source = "github-fallback"; }
-        }
-
-        // Cache file metadata (only for Modrinth results)
-        let fmeta = null;
-        if (bestModrinth) fmeta = pickPrimaryFile(bestModrinth);
-
-        // Build project URL for badge link
-        const typePath =
-          (proj?.project_type === "mod" || cat === "mod") ? "mod" :
-          (proj?.project_type === "resourcepack" || cat === "resourcepack") ? "resourcepack" :
-          (proj?.project_type === "shader" || cat === "shaderpack") ? "shader" :
-          "project";
-        const project_url = proj?.slug
-          ? `https://modrinth.com/${typePath}/${proj.slug}`
-          : `https://modrinth.com/project/${pid}`;
-
-        return {
-          project_id: pid,
-          project_url,
-          category: cat,
-          name: proj?.title || rep?.name || "(unknown)",
-          slug: proj?.slug,
-          current_version_number: rep?.version_number || "-",
-          current_mc: PACK_MC,
-          target_loader: loader,
-          target_available: !!best,
-          target_version_number: best?.version_number || "-",
-          target_mc: TARGET_MC,
-          target_date: best?.date_published || null,
-          download_url: best?.files?.[0]?.url || best?.download_url || null,
-          source,
-          // cached file meta for builder
-          target_file_sha1:   fmeta?.hashes?.sha1 || null,
-          target_file_sha512: fmeta?.hashes?.sha512 || null,
-          target_file_size:   Number.isFinite(fmeta?.size) ? fmeta.size : null,
-          target_file_url:    fmeta?.url || null,
-          target_file_name:   fmeta?.filename || null
-        };
-      },
-      (done, total) => {
-        setPhase("Checking target availability…", `${done} / ${total}`);
-        const stepBase = 3;
-        const stepWidth = done / total;
-        setBar(stepBase + stepWidth, 5);
-      }
-    );
-
-    // Step 5: render & enable builder
+    // Step 5: Render results
     setPhase("Rendering results…");
-    renderPartitionedTables(rows);
+    resultsTable.render(rows);
     outRaw.textContent = JSON.stringify(rows, null, 2);
-
-    const total = rows.length;
-    const have = rows.filter(r => r.target_available).length;
-    outSummary.textContent = `Done. ${have}/${total} have a ${TARGET_MC} build.`;
+    resultsTable.updateSummary(rows, TARGET_MC);
     setBar(5, 5);
     setPhase("Done");
 
-    LAST_ROWS = rows;
-    LAST_TARGET_MC = TARGET_MC;
-    
-    // Show build controls after successful check
+    // Step 6: Enable build controls and missing items tracking
     buildControls.style.display = "flex";
     buildBtn.disabled = false;
     buildNote.textContent = "Ready to build a new .mrpack from Modrinth results.";
 
     // Show capture missing button only if there are missing items
-    const missingItems = rows.filter(r => !r.target_available);
+    const missingItems = currentModpack.getMissingItems();
     if (missingItems.length > 0) {
       captureMissingBtn.disabled = false;
       captureMissingBtn.style.display = "inline-block";
@@ -623,101 +1082,6 @@ runBtn.addEventListener("click", async () => {
     setPhase("Error", err?.message || String(err));
   }
 });
-
-/* ---------- CAPTURE MISSING ITEMS ---------- */
-captureMissingBtn.addEventListener("click", () => {
-  if (!LAST_ROWS.length || !LAST_INDEX) {
-    alert("Run a check first.");
-    return;
-  }
-
-  const missingItems = LAST_ROWS.filter(r => !r.target_available);
-  if (!missingItems.length) {
-    alert("No missing items found in the last check!");
-    return;
-  }
-
-  let captured = 0;
-  for (const item of missingItems) {
-    addMissingItem(
-      item.name,
-      item.category,
-      LAST_TARGET_MC,
-      LAST_PACK_NAME,
-      item.project_id
-    );
-    captured++;
-  }
-
-  showNotification(`Captured ${captured} missing items for tracking.`);
-  updateMissingItemsIcon();
-});
-
-function renderPartitionedTables(rows) {
-  const mods = rows.filter(r => r.category === "mod");
-  const res  = rows.filter(r => r.category === "resourcepack");
-  const sh   = rows.filter(r => r.category === "shaderpack");
-  $("mods-table").innerHTML   = renderTable(mods);
-  $("res-table").innerHTML    = renderTable(res);
-  $("shader-table").innerHTML = renderTable(sh);
-}
-
-function renderTable(rows) {
-  if (!rows?.length) return `<div class="muted">No entries.</div>`;
-  
-  // Sort by availability (unavailable first), then alphabetically by name
-  const sortedRows = [...rows].sort((a, b) => {
-    // First sort by availability (false before true, so unavailable comes first)
-    if (a.target_available !== b.target_available) {
-      return a.target_available - b.target_available;
-    }
-    // Then sort alphabetically by name
-    const nameA = (a.name || "(unknown)").toLowerCase();
-    const nameB = (b.name || "(unknown)").toLowerCase();
-    return nameA.localeCompare(nameB);
-  });
-  
-  const targetMc = rows[0]?.target_mc || "(target)";
-  const html = [
-    "<table>",
-    "<thead><tr>",
-    "<th>Name</th>",
-    "<th>Current mod</th>",
-    "<th>Current MC</th>",
-    "<th>Loader</th>",
-    `<th>Has ${escapeHtml(targetMc)}</th>`,
-    "<th>Target mod</th>",
-    "<th>Source</th>",
-    "<th>Published</th>",
-    "<th>Download</th>",
-    "</tr></thead><tbody>",
-    ...sortedRows.map(r => {
-      const ok = r.target_available;
-      const date = r.target_date ? new Date(r.target_date).toLocaleDateString() : "-";
-      const dl = r.download_url ? `<a href="${r.download_url}" target="_blank" rel="noreferrer">.jar</a>` : "";
-      const sourceBadge =
-        r.source === "github-fallback"
-          ? `<a class="badge github-fallback" href="https://github.com/gnembon/fabric-carpet/releases" target="_blank" rel="noreferrer" title="Found on GitHub because Modrinth had no ${escapeHtml(r.target_mc)} build">GitHub fallback</a>`
-          : r.source === "modrinth"
-            ? `<a class="badge modrinth" href="${escapeHtml(r.project_url)}" target="_blank" rel="noreferrer"
-                 title="Open on Modrinth${r.target_file_sha512 ? ' — included in .mrpack' : ''}">Modrinth</a>`
-            : `<span class="badge" title="No match">–</span>`;
-      return `<tr>
-        <td>${escapeHtml(r.name || "(unknown)")}</td>
-        <td>${escapeHtml(r.current_version_number)}</td>
-        <td>${escapeHtml(r.current_mc)}</td>
-        <td>${escapeHtml(r.target_loader || "-")}</td>
-        <td class="${ok ? "ok" : "no"}">${ok ? "✅" : "❌"}</td>
-        <td>${escapeHtml(r.target_version_number)}</td>
-        <td>${sourceBadge}</td>
-        <td>${date}</td>
-        <td>${dl}</td>
-      </tr>`;
-    }),
-    "</tbody></table>"
-  ].join("");
-  return html;
-}
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -743,106 +1107,7 @@ async function getRecommendedLoaderVersion(targetMc, loaderName) {
 
 /* ---------- MRPACK BUILDER (uses cached file metadata) ---------- */
 buildBtn.addEventListener("click", async () => {
-  if (!LAST_ROWS.length || !LAST_INDEX || !LAST_ZIP) {
-    alert("Run a check first.");
-    return;
-  }
-
-  buildBtn.disabled = true;
-  dlLink.style.display = "none";
-  buildNote.textContent = "Building .mrpack…";
-  setPhase("Packaging mrpack…");
-  setBar(4, 5);
-
-  try {
-    // Only include rows with Modrinth source and cached file meta
-    const includable = LAST_ROWS.filter(r =>
-      r.target_available &&
-      r.source === "modrinth" &&
-      r.target_file_sha512 && r.target_file_sha1 &&
-      r.target_file_size && r.target_file_url
-    );
-
-    const fileRecords = [];
-    for (const row of includable) {
-      const of = PROJECTID_TO_ORIGFILE.get(row.project_id) || {};
-      const path = of.path || inferPathFromCategory(row);
-      const env  = of.env || { client: "required", server: "required" };
-      fileRecords.push({
-        path,
-        hashes: { sha512: row.target_file_sha512, sha1: row.target_file_sha1 },
-        env,
-        downloads: [row.target_file_url],
-        fileSize: row.target_file_size
-      });
-    }
-
-    // Build new index
-    const newIndex = structuredClone(LAST_INDEX);
-    newIndex.dependencies = Object.assign({}, newIndex.dependencies, { minecraft: LAST_TARGET_MC });
-
-    // If selected loader is fabric, set fabric-loader to recommended version for target MC
-    let loaderNote = "";
-    if (LAST_SELECTED_LOADER === "fabric") {
-      const rec = await getRecommendedLoaderVersion(LAST_TARGET_MC, "fabric");
-      if (rec) {
-        newIndex.dependencies["fabric-loader"] = rec;
-        loaderNote = `Fabric Loader set to ${rec}.`;
-      } else {
-        if (newIndex.dependencies["fabric-loader"]) {
-          loaderNote = `Kept existing Fabric Loader ${newIndex.dependencies["fabric-loader"]} (meta lookup failed).`;
-        } else {
-          loaderNote = `Fabric Loader not set (meta lookup failed).`;
-        }
-      }
-    }
-
-    newIndex.name = `${(LAST_PACK_NAME || "Pack").replace(/\s+$/, "")} (for ${LAST_TARGET_MC})`;
-    newIndex.files = fileRecords;
-
-    // Package: copy overrides/ + write index
-    const outZip = new JSZip();
-
-    const overrideEntries = Object.values(LAST_ZIP.files).filter(e => e.name.startsWith("overrides/") && !e.dir);
-    for (const e of overrideEntries) {
-      const content = await LAST_ZIP.file(e.name).async("arraybuffer");
-      outZip.file(e.name, content);
-    }
-    outZip.file("modrinth.index.json", JSON.stringify(newIndex, null, 2));
-
-    const blob = await outZip.generateAsync({ type: "blob" });
-    const fileName = `${slugify(newIndex.name)}.mrpack`;
-
-    const url = URL.createObjectURL(blob);
-    dlLink.href = url;
-    dlLink.download = fileName;
-    dlLink.textContent = `Download ${fileName}`;
-    dlLink.style.display = "inline";
-
-    // Warn about excluded rows (GitHub fallback / missing meta)
-    const skipped = LAST_ROWS.filter(r =>
-      r.target_available &&
-      (r.source !== "modrinth" || !(r.target_file_sha512 && r.target_file_sha1 && r.target_file_size && r.target_file_url))
-    );
-
-    if (!skipped.length) {
-      buildNote.textContent = `Built from all available Modrinth versions. ${loaderNote}`;
-    } else {
-      const names = skipped.map(r => r.name || r.slug || r.project_id).join(", ");
-      buildNote.innerHTML =
-        `Built pack excludes ${skipped.length} item(s) without Modrinth-downloadable metadata (e.g., GitHub fallback): ` +
-        `<span class="muted">${escapeHtml(names)}</span>. ${escapeHtml(loaderNote)}`;
-    }
-
-    setBar(5, 5);
-    setPhase("Done");
-  } catch (e) {
-    console.error(e);
-    buildNote.textContent = `Build failed: ${e.message || e}`;
-    setPhase("Error", e.message || String(e));
-  } finally {
-    buildBtn.disabled = false;
-  }
+  await currentModpack.build();
 });
 
 function inferPathFromCategory(row) {
@@ -859,287 +1124,86 @@ function slugify(s) {
 }
 
 /* ---------- MISSING ITEMS UI FUNCTIONS ---------- */
-function renderMissingItems() {
-  const data = getMissingItems();
-  const items = data.items || [];
-  
-  if (items.length === 0) {
-    missingItemsList.innerHTML = '<p class="muted">No missing items tracked yet. Use "Remember missing items" when building modpacks to track unavailable mods.</p>';
-    return;
-  }
-  
-  const html = items.map(item => {
-    const statusClass = item.found ? 'found' : 'not-found';
-    const statusText = item.found ? '✅ Found' : '❌ Still missing';
-    const lastChecked = item.lastChecked 
-      ? new Date(item.lastChecked).toLocaleString()
-      : 'Never checked';
-    
-    // Build view on Modrinth URL if we have project ID
-    const modrinthUrl = item.projectId ? `https://modrinth.com/project/${item.projectId}` : null;
-    const viewButton = modrinthUrl 
-      ? `<button class="missing-item-view" onclick="window.open('${modrinthUrl}', '_blank')">View on Modrinth</button>`
-      : '';
-    
-    return `
-      <div class="missing-item">
-        <div class="missing-item-header">
-          <h4 class="missing-item-name">
-            ${escapeHtml(item.name)}
-            <span class="missing-item-mc">${escapeHtml(item.targetMcVersion)}</span>
-          </h4>
-          <span class="missing-item-status ${statusClass}">${statusText}</span>
-        </div>
-        <div class="missing-item-details">
-          <div><strong>Category:</strong> ${escapeHtml(item.category)} | <strong>Added:</strong> ${new Date(item.dateAdded).toLocaleString()}</div>
-          <div><strong>From modpack:</strong> ${escapeHtml(item.originalModpack)}</div>
-        </div>
-        <div class="missing-item-actions">
-          ${viewButton}
-          <button class="missing-item-remove" onclick="removeMissingItemUI('${item.id}')">Remove</button>
-          <span class="missing-item-lastcheck"><strong>Last checked:</strong> ${lastChecked}</span>
-        </div>
-      </div>
-    `;
-  }).join('');
-  
-  missingItemsList.innerHTML = html;
-}
-
-function removeMissingItemUI(id) {
-  removeMissingItem(id);
-  renderMissingItems();
-  updateMissingItemsButtonTitle();
-  showNotification("Missing item removed.");
-}
-
-async function checkMissingItemsForUpdates() {
-  if (isCheckingMissingItems) return;
-  
-  const data = getMissingItems();
-  const items = data.items || [];
-  
-  if (items.length === 0) {
-    showNotification("No missing items to check.");
-    return;
-  }
-  
-  isCheckingMissingItems = true;
-  missingItemsBtn.classList.add('checking');
-  checkMissingItemsBtn.disabled = true;
-  missingItemsStatus.textContent = "Checking for updates...";
-  
-  let foundCount = 0;
-  let checkedCount = 0;
-  
-  try {
-    // Check each missing item
-    for (const item of items) {
-      missingItemsStatus.textContent = `Checking ${checkedCount + 1}/${items.length}: ${item.name}`;
-      
-      let found = false;
-      
-      if (item.projectId) {
-        // If we have a project ID, check Modrinth directly
-        try {
-          const loader = item.category === "mod" ? "fabric" : "minecraft"; // Default to fabric for mods
-          const url = new URL(`https://api.modrinth.com/v2/project/${item.projectId}/version`);
-          url.searchParams.set("game_versions", JSON.stringify([item.targetMcVersion]));
-          url.searchParams.set("loaders", JSON.stringify([loader]));
-          
-          const res = await fetch(url);
-          if (res.ok) {
-            const versions = await res.json();
-            found = Array.isArray(versions) && versions.length > 0;
-          }
-        } catch (e) {
-          console.warn(`Failed to check project ${item.projectId}:`, e);
-        }
-      } else {
-        // If no project ID, try to search by name
-        try {
-          const searchUrl = new URL("https://api.modrinth.com/v2/search");
-          searchUrl.searchParams.set("query", item.name);
-          searchUrl.searchParams.set("limit", "10");
-          
-          const searchRes = await fetch(searchUrl);
-          if (searchRes.ok) {
-            const searchData = await searchRes.json();
-            const hits = searchData.hits || [];
-            
-            // Look for exact or close name matches
-            for (const hit of hits) {
-              if (hit.title.toLowerCase().includes(item.name.toLowerCase()) || 
-                  item.name.toLowerCase().includes(hit.title.toLowerCase())) {
-                // Check if this project has versions for our target MC
-                try {
-                  const loader = item.category === "mod" ? "fabric" : "minecraft";
-                  const versionUrl = new URL(`https://api.modrinth.com/v2/project/${hit.project_id}/version`);
-                  versionUrl.searchParams.set("game_versions", JSON.stringify([item.targetMcVersion]));
-                  versionUrl.searchParams.set("loaders", JSON.stringify([loader]));
-                  
-                  const versionRes = await fetch(versionUrl);
-                  if (versionRes.ok) {
-                    const versions = await versionRes.json();
-                    if (Array.isArray(versions) && versions.length > 0) {
-                      found = true;
-                      break;
-                    }
-                  }
-                } catch (e) {
-                  console.warn(`Failed to check versions for ${hit.project_id}:`, e);
-                }
-              }
-            }
-          }
-        } catch (e) {
-          console.warn(`Failed to search for ${item.name}:`, e);
-        }
-      }
-      
-      updateMissingItemStatus(item.id, found);
-      if (found) foundCount++;
-      checkedCount++;
-      
-      // Small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    
-    // Update UI
-    renderMissingItems();
-    
-    if (foundCount > 0) {
-      const foundItems = items.filter(item => {
-        const updated = getMissingItems().items.find(i => i.id === item.id);
-        return updated && updated.found;
-      }).map(item => `${item.name} (${item.originalModpack})`);
-      
-      showNotification(`🎉 Found ${foundCount} missing item(s)! Check these modpacks: ${foundItems.join(', ')}`);
-    } else {
-      showNotification("No updates found for missing items.");
-    }
-    
-    missingItemsStatus.textContent = `Last checked: ${new Date().toLocaleString()}`;
-    
-  } catch (e) {
-    console.error("Error checking missing items:", e);
-    missingItemsStatus.textContent = "Error checking for updates.";
-    showNotification("Error occurred while checking for updates.");
-  } finally {
-    isCheckingMissingItems = false;
-    missingItemsBtn.classList.remove('checking');
-    checkMissingItemsBtn.disabled = false;
-  }
-}
 
 // Auto-check missing items when page loads
 window.addEventListener('load', () => {
   // Update missing items button title with count
-  updateMissingItemsButtonTitle();
-  
-  const data = getMissingItems();
+  missingItemsManager.updateMissingItemsButtonTitle();
+
+  const data = missingItemsManager.getMissingItems();
   if (data.items && data.items.length > 0) {
     // Wait a bit for the page to fully load, then check in background
     setTimeout(() => {
-      checkMissingItemsForUpdates();
+      missingItemsManager.checkMissingItemsForUpdates();
     }, 1000);
   }
 });
 
-function updateMissingItemsButtonTitle() {
-  const data = getMissingItems();
-  const count = data.items ? data.items.length : 0;
-  
-  if (count > 0) {
-    missingItemsBtn.title = `Missing Items Tracker (${count} tracked)`;
-  } else {
-    missingItemsBtn.title = "Missing Items Tracker";
-  }
-}
-
-function updateMissingItemsIcon() {
-  const data = getMissingItems();
-  const count = data.items ? data.items.length : 0;
-  
-  if (count > 0) {
-    missingItemsBtn.title = `Missing Items Tracker (${count} items)`;
-  } else {
-    missingItemsBtn.title = "Missing Items Tracker";
-  }
-
-  // Update icon based on status
-  if (isCheckingMissingItems) {
-    missingItemsBtn.classList.add("checking");
-  } else {
-    missingItemsBtn.classList.remove("checking");
-  }
-}
-
 // Handle capture missing items button
 captureMissingBtn.addEventListener("click", () => {
-  if (!LAST_ROWS.length || !LAST_PACK_NAME || !LAST_TARGET_MC) {
+  if (!currentModpack.hasResults()) {
     alert("Run a check first to capture missing items.");
     return;
   }
-  
+
   // Find items that are not available for the target version
-  const missingItems = LAST_ROWS.filter(row => !row.target_available);
-  
+  const missingItems = currentModpack.getMissingItems();
+
   if (missingItems.length === 0) {
     showNotification("No missing items to capture - all mods are available for the target version!");
     return;
   }
-  
+
   let newItemsCount = 0;
   let updatedItemsCount = 0;
-  
+
   for (const row of missingItems) {
-    const data = getMissingItems();
-    const id = `${row.category}-${row.name || row.slug || "(unknown)"}-${LAST_TARGET_MC}`.replace(/[^a-zA-Z0-9\-]/g, '-');
+    const data = missingItemsManager.getMissingItems();
+    const id = `${row.category}-${row.name || row.slug || "(unknown)"}-${currentModpack.targetMc}`.replace(/[^a-zA-Z0-9\-]/g, '-');
     const existing = data.items.find(item => item.id === id);
-    
+
     if (existing) {
-      const modpacks = existing.originalModpack.split(', ').map(mp => mp.trim());
-      if (!modpacks.includes(LAST_PACK_NAME)) {
+      const modpacks = parseModpackNames(existing.originalModpack);
+      if (!modpacks.includes(currentModpack.packName)) {
         updatedItemsCount++;
       }
     } else {
       newItemsCount++;
     }
-    
-    addMissingItem(
+
+    missingItemsManager.addMissingItem(
       row.name || row.slug || "(unknown)",
       row.category,
-      LAST_TARGET_MC,
-      LAST_PACK_NAME,
+      currentModpack.targetMc,
+      currentModpack.packName,
       row.project_id
     );
   }
-  
+
   let message = "";
   if (newItemsCount > 0 && updatedItemsCount > 0) {
-    message = `Added ${newItemsCount} new missing items and updated ${updatedItemsCount} existing items with "${LAST_PACK_NAME}".`;
+    message = `Added ${newItemsCount} new missing items and updated ${updatedItemsCount} existing items with "${currentModpack.packName}".`;
   } else if (newItemsCount > 0) {
-    message = `Added ${newItemsCount} new missing items from "${LAST_PACK_NAME}".`;
+    message = `Added ${newItemsCount} new missing items from "${currentModpack.packName}".`;
   } else if (updatedItemsCount > 0) {
-    message = `Updated ${updatedItemsCount} existing items with "${LAST_PACK_NAME}".`;
+    message = `Updated ${updatedItemsCount} existing items with "${currentModpack.packName}".`;
   } else {
-    message = `All ${missingItems.length} missing items were already tracked for "${LAST_PACK_NAME}".`;
+    message = `All ${missingItems.length} missing items were already tracked for "${currentModpack.packName}".`;
   }
-  
+
   showNotification(message);
-  updateMissingItemsButtonTitle();
+  missingItemsManager.updateMissingItemsButtonTitle();
 });
 
 // Check missing items on page load if any exist
 document.addEventListener("DOMContentLoaded", () => {
-  updateMissingItemsButtonTitle();
-  
-  const data = getMissingItems();
+  missingItemsManager.updateMissingItemsButtonTitle();
+
+  const data = missingItemsManager.getMissingItems();
   if (data.items.length > 0) {
     // Auto-check in background
     setTimeout(() => {
-      checkMissingItemsForUpdates();
+      missingItemsManager.checkMissingItemsForUpdates();
     }, 2000); // Wait 2 seconds after page load
   }
 });
