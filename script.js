@@ -39,7 +39,125 @@ function compareVersions(a, b) {
 }
 
 function parseModpackNames(modpackString) {
+  if (!modpackString || typeof modpackString !== 'string') {
+    return [];
+  }
   return modpackString.split(', ').map(mp => mp.trim());
+}
+
+/* ---------- COMMON MODRINTH UTILITIES ---------- */
+
+/**
+ * Fetch versions for a Modrinth project with specific MC version and loader filters
+ * @param {string} projectId - The Modrinth project ID
+ * @param {string} mc - Target Minecraft version
+ * @param {string} loader - Target loader (e.g., "fabric", "minecraft")
+ * @param {string} [projectName] - Optional project name for debugging
+ * @returns {Promise<Array|null>} - Array of version objects or null on error
+ */
+async function fetchModrinthVersions(projectId, mc, loader, projectName = null) {
+  try {
+    const url = new URL(`https://api.modrinth.com/v2/project/${projectId}/version`);
+    url.searchParams.set("game_versions", JSON.stringify([mc]));
+    url.searchParams.set("loaders", JSON.stringify([loader]));
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      const projectLabel = projectName ? ` (${projectName})` : '';
+      console.warn(`Failed to fetch versions for ${projectId}${projectLabel}: ${res.status}`);
+      return null;
+    }
+
+    const versions = await res.json();
+    return Array.isArray(versions) ? versions : null;
+  } catch (e) {
+    const projectLabel = projectName ? ` (${projectName})` : '';
+    console.warn(`Error fetching versions for ${projectId}${projectLabel}:`, e);
+    return null;
+  }
+}
+
+/**
+ * Resolve a Modrinth project ID from a project name
+ * @param {string} name - The project name to search for
+ * @param {string} category - Project category ("mod", "resourcepack", "shaderpack")
+ * @returns {Promise<string|null>} - The project ID or null if not found
+ */
+async function resolveProjectIdFromName(name, category) {
+  const loader = category === "mod" ? "fabric" : "minecraft";
+
+  try {
+    const searchUrl = new URL("https://api.modrinth.com/v2/search");
+    searchUrl.searchParams.set("query", name);
+    searchUrl.searchParams.set("limit", "10");
+
+    const searchRes = await fetch(searchUrl);
+    if (searchRes.ok) {
+      const searchData = await searchRes.json();
+      const hits = searchData.hits || [];
+
+      // Look for exact or close name matches
+      for (const hit of hits) {
+        if (hit.title.toLowerCase().includes(name.toLowerCase()) ||
+            name.toLowerCase().includes(hit.title.toLowerCase())) {
+          // Verify this project has some versions (basic validation)
+          try {
+            const versionUrl = new URL(`https://api.modrinth.com/v2/project/${hit.project_id}/version`);
+            versionUrl.searchParams.set("game_versions", JSON.stringify(["1.20.1"])); // Use a common version for validation
+            versionUrl.searchParams.set("loaders", JSON.stringify([loader]));
+            versionUrl.searchParams.set("limit", "1");
+
+            const versionRes = await fetch(versionUrl);
+            if (versionRes.ok) {
+              const versions = await versionRes.json();
+              if (Array.isArray(versions) && versions.length > 0) {
+                return hit.project_id; // Found a valid project
+              }
+            }
+          } catch (e) {
+            console.warn(`Failed to validate project ${hit.project_id}:`, e);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`Failed to resolve project ID for ${name}:`, e);
+  }
+  return null;
+}
+
+/**
+ * Check if a Modrinth project has any compatible versions for the given MC version and loader
+ * @param {string} projectId - The Modrinth project ID
+ * @param {string} targetMc - Target Minecraft version
+ * @param {string} loader - Target loader (e.g., "fabric", "minecraft")
+ * @param {string} [projectName] - Optional project name for debugging
+ * @returns {Promise<boolean>} - True if compatible versions exist
+ */
+async function checkModrinthVersionAvailability(projectId, targetMc, loader, projectName = null) {
+  const versions = await fetchModrinthVersions(projectId, targetMc, loader, projectName);
+  return versions && versions.length > 0;
+}
+
+/**
+ * Get the best target version for a Modrinth project
+ * @param {string} projectId - The Modrinth project ID
+ * @param {string} mc - Target Minecraft version
+ * @param {string} loader - Target loader (e.g., "fabric", "minecraft")
+ * @param {string} [projectName] - Optional project name for debugging
+ * @returns {Promise<Object|null>} - Best version object or null if none found
+ */
+async function getBestTargetVersion(projectId, targetMc, loader, projectName = null) {
+  const versions = await fetchModrinthVersions(projectId, targetMc, loader, projectName);
+  if (!versions || !versions.length) return null;
+
+  const tier = v => v.version_type === "release" ? 3 : v.version_type === "beta" ? 2 : 1;
+  versions.sort((a, b) => {
+    const t = tier(b) - tier(a);
+    if (t) return t;
+    return new Date(b.date_published) - new Date(a.date_published);
+  });
+  return versions[0];
 }
 
 /* ---------- MODPACK CLASS ---------- */
@@ -50,6 +168,7 @@ class Modpack {
 
   reset() {
     this.name = "";
+    this.packName = ""; // Alias for name, used for missing items
     this.targetMc = "";
     this.selectedLoader = "fabric";
     this.index = null;
@@ -60,6 +179,7 @@ class Modpack {
 
   setMetadata(name, targetMc, loader) {
     this.name = name;
+    this.packName = name; // Keep packName in sync with name
     this.targetMc = targetMc;
     this.selectedLoader = loader;
   }
@@ -101,6 +221,7 @@ class Modpack {
     const index = JSON.parse(await indexFile.async("string"));
     this.index = index;
     this.name = index?.name || "Updated Pack";
+    this.packName = this.name; // Keep packName in sync
 
     // Update page title with pack name
     updateTitle(this.name);
@@ -163,22 +284,7 @@ class Modpack {
       if (!r.ok) return null;
       return r.json();
     }
-    async function getBestTargetVersion(projectId, mc, loader) {
-      const url = new URL(`https://api.modrinth.com/v2/project/${projectId}/version`);
-      url.searchParams.set("game_versions", JSON.stringify([mc]));
-      url.searchParams.set("loaders", JSON.stringify([loader]));
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`versions ${projectId}: ${res.status}`);
-      const arr = await res.json();
-      if (!Array.isArray(arr) || !arr.length) return null;
-      const tier = v => v.version_type === "release" ? 3 : v.version_type === "beta" ? 2 : 1;
-      arr.sort((a, b) => {
-        const t = tier(b) - tier(a);
-        if (t) return t;
-        return new Date(b.date_published) - new Date(a.date_published);
-      });
-      return arr[0];
-    }
+
 
     async function mapLimitProgress(items, limit, fn, onTick) {
       const out = new Array(items.length);
@@ -210,7 +316,7 @@ class Modpack {
         const loader = loaderForCategory(cat);
         const [proj, bestModrinth] = await Promise.all([
           getProject(pid),
-          getBestTargetVersion(pid, targetMc, loader)
+          getBestTargetVersion(pid, targetMc, loader, rep?.name)
         ]);
 
         let best = bestModrinth;
@@ -481,22 +587,69 @@ class MissingItemsManager {
     const APP_PATH = window.location.pathname.replace(/\/[^\/]*$/, '') || '/';
     this.STORAGE_PREFIX = `mrpack${APP_PATH.replace(/[^a-zA-Z0-9]/g, '_')}_`;
     this.MISSING_ITEMS_KEY = `${this.STORAGE_PREFIX}missing_items`;
-    this.MISSING_ITEMS_VERSION = 1;
+    this.MISSING_ITEMS_VERSION = 3; // Updated to version 3 - includes loader
     this.isCheckingMissingItems = false;
   }
 
   // Storage operations
-  getMissingItems() {
+  async getMissingItems() {
     try {
       const stored = localStorage.getItem(this.MISSING_ITEMS_KEY);
       if (!stored) return { version: this.MISSING_ITEMS_VERSION, items: [] };
 
       const data = JSON.parse(stored);
-      // Handle version upgrades if needed
-      if (data.version !== this.MISSING_ITEMS_VERSION) {
-        return { version: this.MISSING_ITEMS_VERSION, items: [] };
+      
+      // Handle version upgrades
+      if (data.version < 3) {
+        // Upgrade from version 1 or 2 to version 3: ensure project IDs and loaders are present
+        console.log(`Upgrading missing items storage from version ${data.version} to version 3...`);
+        const upgradedItems = [];
+        
+        for (const item of data.items || []) {
+          if (item.projectId && item.loader) {
+            // Already has project ID and loader, keep as-is
+            upgradedItems.push(item);
+          } else if (item.projectId && !item.loader) {
+            // Has project ID but missing loader (version 2 item)
+            upgradedItems.push({
+              ...item,
+              loader: item.category === "mod" ? "fabric" : "minecraft"
+            });
+          } else {
+            // Need to resolve name to project ID (version 1 item)
+            try {
+              const resolvedId = await resolveProjectIdFromName(item.name, item.category);
+              if (resolvedId) {
+                console.log(`Resolved ${item.name} to project ID ${resolvedId}`);
+                upgradedItems.push({
+                  ...item,
+                  projectId: resolvedId,
+                  loader: item.category === "mod" ? "fabric" : "minecraft"
+                });
+              } else {
+                console.warn(`Could not resolve project ID for ${item.name}, skipping item`);
+                // Skip items that can't be resolved
+              }
+            } catch (e) {
+              console.warn(`Error resolving project ID for ${item.name}:`, e);
+              // Skip items that fail to resolve
+            }
+          }
+        }
+        
+        const upgradedData = { 
+          version: this.MISSING_ITEMS_VERSION, 
+          items: upgradedItems 
+        };
+        
+        // Save the upgraded data
+        this.saveMissingItems(upgradedData);
+        console.log(`Upgraded ${upgradedItems.length} items to version 3 storage`);
+        
+        return upgradedData;
       }
-
+      
+      // Version 2 or higher
       return data;
     } catch (e) {
       console.warn("Failed to load missing items:", e);
@@ -515,8 +668,8 @@ class MissingItemsManager {
   }
 
   // Data manipulation
-  addMissingItem(name, category, targetMcVersion, originalModpack, projectId = null) {
-    const data = this.getMissingItems();
+  async addMissingItem(name, category, targetMcVersion, originalModpack, projectId = null, loader = null) {
+    const data = await this.getMissingItems();
     const id = `${category}-${name}-${targetMcVersion}`.replace(/[^a-zA-Z0-9\-]/g, '-');
 
     // Check if already exists
@@ -540,6 +693,7 @@ class MissingItemsManager {
       targetMcVersion,
       originalModpack,
       projectId,
+      loader: loader || (category === "mod" ? "fabric" : "minecraft"), // Default loader based on category
       dateAdded: new Date().toISOString(),
       lastChecked: null,
       found: false
@@ -550,14 +704,16 @@ class MissingItemsManager {
     return item;
   }
 
-  removeMissingItem(id) {
-    const data = this.getMissingItems();
+  async removeMissingItem(id) {
+    // This method doesn't need to be async since it doesn't read data
+    const data = await this.getMissingItems();
     data.items = data.items.filter(item => item.id !== id);
     this.saveMissingItems(data);
   }
 
-  updateMissingItemStatus(id, found, lastChecked = null) {
-    const data = this.getMissingItems();
+  async updateMissingItemStatus(id, found, lastChecked = null) {
+    // This method doesn't need to be async since it doesn't read data
+    const data = await this.getMissingItems();
     const item = data.items.find(item => item.id === id);
     if (item) {
       item.found = found;
@@ -570,8 +726,9 @@ class MissingItemsManager {
     this.saveMissingItems({ version: this.MISSING_ITEMS_VERSION, items: [] });
   }
 
-  removeMissingItemFromModpack(id, modpackName) {
-    const data = this.getMissingItems();
+  async removeMissingItemFromModpack(id, modpackName) {
+    // This method doesn't need to be async since it doesn't read data
+    const data = await this.getMissingItems();
     const item = data.items.find(item => item.id === id);
     if (item) {
       const modpacks = parseModpackNames(item.originalModpack);
@@ -589,8 +746,8 @@ class MissingItemsManager {
   }
 
   // UI rendering
-  renderMissingItems() {
-    const data = this.getMissingItems();
+  async renderMissingItems() {
+    const data = await this.getMissingItems();
     const items = data.items || [];
 
     if (items.length === 0) {
@@ -633,8 +790,8 @@ class MissingItemsManager {
             <span class="missing-item-status ${statusClass}">${statusText}</span>
           </div>
           <div class="missing-item-details">
-            <div><strong>Category:</strong> ${escapeHtml(item.category)} | <strong>Added:</strong> ${new Date(item.dateAdded).toLocaleString()}</div>
-            <div><strong>From modpack:</strong> ${escapeHtml(item.originalModpack)}</div>
+            <div><strong>Category:</strong> ${escapeHtml(item.category)} | <strong>Loader:</strong> ${escapeHtml(item.loader || 'Unknown')} | <strong>Added:</strong> ${new Date(item.dateAdded).toLocaleString()}</div>
+            <div><strong>From modpack:</strong> ${escapeHtml(item.originalModpack || 'Unknown')}</div>
           </div>
           <div class="missing-item-actions">
             ${viewButton}
@@ -648,9 +805,9 @@ class MissingItemsManager {
     missingItemsList.innerHTML = html;
   }
 
-  removeMissingItemUI(id) {
+  async removeMissingItemUI(id) {
     this.removeMissingItem(id);
-    this.renderMissingItems();
+    await this.renderMissingItems();
     this.updateMissingItemsButtonTitle();
     showNotification("Missing item removed.");
   }
@@ -659,7 +816,7 @@ class MissingItemsManager {
   async checkMissingItemsForUpdates() {
     if (this.isCheckingMissingItems) return;
 
-    const data = this.getMissingItems();
+    const data = await this.getMissingItems(); // Now async due to potential upgrades
     const items = data.items || [];
 
     if (items.length === 0) {
@@ -680,65 +837,15 @@ class MissingItemsManager {
       for (const item of items) {
         missingItemsStatus.textContent = `Checking ${checkedCount + 1}/${items.length}: ${item.name}`;
 
-        let found = false;
-
-        if (item.projectId) {
-          // If we have a project ID, check Modrinth directly
-          try {
-            const loader = item.category === "mod" ? "fabric" : "minecraft"; // Default to fabric for mods
-            const url = new URL(`https://api.modrinth.com/v2/project/${item.projectId}/version`);
-            url.searchParams.set("game_versions", JSON.stringify([item.targetMcVersion]));
-            url.searchParams.set("loaders", JSON.stringify([loader]));
-
-            const res = await fetch(url);
-            if (res.ok) {
-              const versions = await res.json();
-              found = Array.isArray(versions) && versions.length > 0;
-            }
-          } catch (e) {
-            console.warn(`Failed to check project ${item.projectId}:`, e);
-          }
-        } else {
-          // If no project ID, try to search by name
-          try {
-            const searchUrl = new URL("https://api.modrinth.com/v2/search");
-            searchUrl.searchParams.set("query", item.name);
-            searchUrl.searchParams.set("limit", "10");
-
-            const searchRes = await fetch(searchUrl);
-            if (searchRes.ok) {
-              const searchData = await searchRes.json();
-              const hits = searchData.hits || [];
-
-              // Look for exact or close name matches
-              for (const hit of hits) {
-                if (hit.title.toLowerCase().includes(item.name.toLowerCase()) ||
-                    item.name.toLowerCase().includes(hit.title.toLowerCase())) {
-                  // Check if this project has versions for our target MC
-                  try {
-                    const loader = item.category === "mod" ? "fabric" : "minecraft";
-                    const versionUrl = new URL(`https://api.modrinth.com/v2/project/${hit.project_id}/version`);
-                    versionUrl.searchParams.set("game_versions", JSON.stringify([item.targetMcVersion]));
-                    versionUrl.searchParams.set("loaders", JSON.stringify([loader]));
-
-                    const versionRes = await fetch(versionUrl);
-                    if (versionRes.ok) {
-                      const versions = await versionRes.json();
-                      if (Array.isArray(versions) && versions.length > 0) {
-                        found = true;
-                        break;
-                      }
-                    }
-                  } catch (e) {
-                    console.warn(`Failed to check versions for ${hit.project_id}:`, e);
-                  }
-                }
-              }
-            }
-          } catch (e) {
-            console.warn(`Failed to search for ${item.name}:`, e);
-          }
+        // All items should now have projectIds after upgrade
+        if (!item.projectId) {
+          console.warn(`Skipping item ${item.name} - no project ID available`);
+          checkedCount++;
+          continue;
         }
+
+        const loader = item.loader || (item.category === "mod" ? "fabric" : "minecraft");
+        let found = await checkModrinthVersionAvailability(item.projectId, item.targetMcVersion, loader, item.name);
 
         this.updateMissingItemStatus(item.id, found);
         if (found) foundCount++;
@@ -753,9 +860,9 @@ class MissingItemsManager {
 
       if (foundCount > 0) {
         const foundItems = items.filter(item => {
-          const updated = this.getMissingItems().items.find(i => i.id === item.id);
+          const updated = data.items.find(i => i.id === item.id);
           return updated && updated.found;
-        }).map(item => `${item.name} (${item.originalModpack})`);
+        }).map(item => `${item.name} (${item.originalModpack || 'Unknown'})`);
 
         showNotification(`🎉 Found ${foundCount} missing item(s)! Check these modpacks: ${foundItems.join(', ')}`);
       } else {
@@ -776,14 +883,18 @@ class MissingItemsManager {
   }
 
   updateMissingItemsButtonTitle() {
-    const data = this.getMissingItems();
-    const count = data.items ? data.items.length : 0;
+    // This needs to be async now
+    this.getMissingItems().then(data => {
+      const count = data.items ? data.items.length : 0;
 
-    if (count > 0) {
-      missingItemsBtn.title = `Missing Items Tracker (${count} tracked)`;
-    } else {
-      missingItemsBtn.title = "Missing Items Tracker";
-    }
+      if (count > 0) {
+        missingItemsBtn.title = `Missing Items Tracker (${count} tracked)`;
+      } else {
+        missingItemsBtn.title = "Missing Items Tracker";
+      }
+    }).catch(e => {
+      console.warn("Failed to update missing items button title:", e);
+    });
   }
 }
 
@@ -874,9 +985,9 @@ helpModal.addEventListener("click", (e) => {
 });
 
 /* ---------- MISSING ITEMS PANEL HANDLERS ---------- */
-missingItemsBtn.addEventListener("click", () => {
+missingItemsBtn.addEventListener("click", async () => {
   missingItemsPanel.style.display = "flex";
-  missingItemsManager.renderMissingItems();
+  await missingItemsManager.renderMissingItems();
 });
 
 missingItemsClose.addEventListener("click", () => {
@@ -893,10 +1004,10 @@ checkMissingItemsBtn.addEventListener("click", () => {
   missingItemsManager.checkMissingItemsForUpdates();
 });
 
-clearMissingItemsBtn.addEventListener("click", () => {
+clearMissingItemsBtn.addEventListener("click", async () => {
   if (confirm("Are you sure you want to clear all missing items? This cannot be undone.")) {
     missingItemsManager.clearMissingItems();
-    missingItemsManager.renderMissingItems();
+    await missingItemsManager.renderMissingItems();
     missingItemsManager.updateMissingItemsButtonTitle();
     showNotification("All missing items cleared.");
   }
@@ -1126,11 +1237,11 @@ function slugify(s) {
 /* ---------- MISSING ITEMS UI FUNCTIONS ---------- */
 
 // Auto-check missing items when page loads
-window.addEventListener('load', () => {
+window.addEventListener('load', async () => {
   // Update missing items button title with count
   missingItemsManager.updateMissingItemsButtonTitle();
 
-  const data = missingItemsManager.getMissingItems();
+  const data = await missingItemsManager.getMissingItems();
   if (data.items && data.items.length > 0) {
     // Wait a bit for the page to fully load, then check in background
     setTimeout(() => {
@@ -1140,8 +1251,8 @@ window.addEventListener('load', () => {
 });
 
 // Handle capture missing items button
-captureMissingBtn.addEventListener("click", () => {
-  if (!currentModpack.hasResults()) {
+captureMissingBtn.addEventListener("click", async () => {
+  if (!currentModpack.hasData()) {
     alert("Run a check first to capture missing items.");
     return;
   }
@@ -1158,7 +1269,7 @@ captureMissingBtn.addEventListener("click", () => {
   let updatedItemsCount = 0;
 
   for (const row of missingItems) {
-    const data = missingItemsManager.getMissingItems();
+    const data = await missingItemsManager.getMissingItems();
     const id = `${row.category}-${row.name || row.slug || "(unknown)"}-${currentModpack.targetMc}`.replace(/[^a-zA-Z0-9\-]/g, '-');
     const existing = data.items.find(item => item.id === id);
 
@@ -1176,7 +1287,8 @@ captureMissingBtn.addEventListener("click", () => {
       row.category,
       currentModpack.targetMc,
       currentModpack.packName,
-      row.project_id
+      row.project_id,
+      currentModpack.selectedLoader
     );
   }
 
@@ -1196,10 +1308,10 @@ captureMissingBtn.addEventListener("click", () => {
 });
 
 // Check missing items on page load if any exist
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   missingItemsManager.updateMissingItemsButtonTitle();
 
-  const data = missingItemsManager.getMissingItems();
+  const data = await missingItemsManager.getMissingItems();
   if (data.items.length > 0) {
     // Auto-check in background
     setTimeout(() => {
