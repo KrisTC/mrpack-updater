@@ -45,6 +45,21 @@ function parseModpackNames(modpackString) {
   return modpackString.split(', ').map(mp => mp.trim());
 }
 
+// Helper function to get default loader for a category
+// NOTE: This should only be used as a fallback when project data is not available.
+// Always prefer getting the correct loader from the original project data using getLoaderForProject().
+function getDefaultLoaderForCategory(category) {
+  switch (category) {
+    case "mod":
+      return "fabric";
+    case "shaderpack":
+      return "iris";
+    case "resourcepack":
+    default:
+      return "minecraft";
+  }
+}
+
 /* ---------- COMMON MODRINTH UTILITIES ---------- */
 
 /**
@@ -57,6 +72,8 @@ function parseModpackNames(modpackString) {
  */
 async function fetchModrinthVersions(projectId, mc, loader, projectName = null) {
   try {
+    console.log(`[DEBUG] Fetching versions for project ${projectId}${projectName ? ` (${projectName})` : ''} - MC: ${mc}, Loader: ${loader}`);
+    
     const url = new URL(`https://api.modrinth.com/v2/project/${projectId}/version`);
     url.searchParams.set("game_versions", JSON.stringify([mc]));
     url.searchParams.set("loaders", JSON.stringify([loader]));
@@ -69,6 +86,7 @@ async function fetchModrinthVersions(projectId, mc, loader, projectName = null) 
     }
 
     const versions = await res.json();
+    console.log(`  [DEBUG] Found ${versions.length} versions for project ${projectId}${projectName ? ` (${projectName})` : ''}`);
     return Array.isArray(versions) ? versions : null;
   } catch (e) {
     const projectLabel = projectName ? ` (${projectName})` : '';
@@ -110,7 +128,7 @@ async function getProjectsBatch(projectIds) {
  * @returns {Promise<string|null>} - The project ID or null if not found
  */
 async function resolveProjectIdFromName(name, category) {
-  const loader = category === "mod" ? "fabric" : "minecraft";
+  const loader = getDefaultLoaderForCategory(category);
 
   try {
     const searchUrl = new URL("https://api.modrinth.com/v2/search");
@@ -302,8 +320,25 @@ class Modpack {
     setBar(3, 6);
 
     // Helpers
-    function loaderForCategory(cat) {
-      return (cat === "resourcepack" || cat === "shaderpack") ? "minecraft" : packLoader;
+    function getLoaderForProject(proj, cat, packLoader) {
+      // For mods, use the pack loader (fabric, etc.)
+      if (cat === "mod") {
+        console.log(`[DEBUG] Using pack loader '${packLoader}' for mod category`);
+        return packLoader;
+      }
+      
+      // For resourcepacks and shaderpacks, use the project's actual loaders if available
+      // Otherwise fall back to category defaults
+      if (proj?.loaders && Array.isArray(proj.loaders) && proj.loaders.length > 0) {
+        const selectedLoader = proj.loaders[0];
+        console.log(`[DEBUG] Using project loader '${selectedLoader}' for ${cat} (available: ${proj.loaders.join(', ')})`);
+        return selectedLoader; // Use first available loader
+      }
+      
+      // Fallback if no project data available
+      const fallbackLoader = (cat === "resourcepack" || cat === "shaderpack") ? "minecraft" : packLoader;
+      console.log(`[DEBUG] No project loaders found, using fallback '${fallbackLoader}' for ${cat}`);
+      return fallbackLoader;
     }
 
 
@@ -337,8 +372,8 @@ class Modpack {
       async (pid) => {
         const rep = projectEntries.get(pid)?.anyVersion;
         const cat = projectEntries.get(pid)?.category || "mod";
-        const loader = loaderForCategory(cat);
         const proj = projectMap.get(pid);
+        const loader = getLoaderForProject(proj, cat, packLoader);
         const bestModrinth = await getBestTargetVersion(pid, targetMc, loader, rep?.name);
 
         let best = bestModrinth;
@@ -635,7 +670,7 @@ class MissingItemsManager {
             // Has project ID but missing loader (version 2 item)
             upgradedItems.push({
               ...item,
-              loader: item.category === "mod" ? "fabric" : "minecraft"
+              loader: getDefaultLoaderForCategory(item.category)
             });
           } else {
             // Need to resolve name to project ID (version 1 item)
@@ -646,7 +681,7 @@ class MissingItemsManager {
                 upgradedItems.push({
                   ...item,
                   projectId: resolvedId,
-                  loader: item.category === "mod" ? "fabric" : "minecraft"
+                  loader: getDefaultLoaderForCategory(item.category)
                 });
               } else {
                 console.warn(`Could not resolve project ID for ${item.name}, skipping item`);
@@ -715,7 +750,7 @@ class MissingItemsManager {
       targetMcVersion,
       originalModpack,
       projectId,
-      loader: loader || (category === "mod" ? "fabric" : "minecraft"), // Default loader based on category
+      loader: loader || getDefaultLoaderForCategory(category), // Default loader based on category
       dateAdded: new Date().toISOString(),
       lastChecked: null,
       found: false
@@ -817,7 +852,7 @@ class MissingItemsManager {
           </div>
           <div class="missing-item-actions">
             ${viewButton}
-            <button class="missing-item-remove" onclick="removeMissingItemUI('${item.id}')">Remove</button>
+            <button class="missing-item-remove" onclick="missingItemsManager.removeMissingItemUI('${item.id}')">Remove</button>
             <span class="missing-item-lastcheck"><strong>Last checked:</strong> ${lastChecked}</span>
           </div>
         </div>
@@ -828,7 +863,7 @@ class MissingItemsManager {
   }
 
   async removeMissingItemUI(id) {
-    this.removeMissingItem(id);
+    await this.removeMissingItem(id);
     await this.renderMissingItems();
     this.updateMissingItemsButtonTitle();
     showNotification("Missing item removed.");
@@ -866,7 +901,7 @@ class MissingItemsManager {
           continue;
         }
 
-        const loader = item.loader || (item.category === "mod" ? "fabric" : "minecraft");
+        const loader = item.loader || getDefaultLoaderForCategory(item.category);
         let found = await checkModrinthVersionAvailability(item.projectId, item.targetMcVersion, loader, item.name);
 
         this.updateMissingItemStatus(item.id, found);
@@ -1310,7 +1345,7 @@ captureMissingBtn.addEventListener("click", async () => {
       currentModpack.targetMc,
       currentModpack.packName,
       row.project_id,
-      currentModpack.selectedLoader
+      row.target_loader
     );
   }
 
