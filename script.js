@@ -78,6 +78,32 @@ async function fetchModrinthVersions(projectId, mc, loader, projectName = null) 
 }
 
 /**
+ * Batch fetch project metadata for multiple projects
+ * @param {string[]} projectIds - Array of Modrinth project IDs
+ * @returns {Promise<Map<string, Object>>} - Map of projectId -> project metadata
+ */
+async function getProjectsBatch(projectIds) {
+  if (!projectIds.length) return new Map();
+
+  try {
+    const url = new URL('https://api.modrinth.com/v2/projects');
+    url.searchParams.set('ids', JSON.stringify(projectIds));
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn(`Failed to batch fetch projects: ${res.status}`);
+      return new Map();
+    }
+
+    const projects = await res.json();
+    return new Map(projects.map(p => [p.id, p]));
+  } catch (e) {
+    console.warn('Error batch fetching projects:', e);
+    return new Map();
+  }
+}
+
+/**
  * Resolve a Modrinth project ID from a project name
  * @param {string} name - The project name to search for
  * @param {string} category - Project category ("mod", "resourcepack", "shaderpack")
@@ -243,7 +269,7 @@ class Modpack {
     if (!sha1s.length) { setPhase("Done"); detail.textContent = "No file hashes in pack."; return null; }
 
     outSummary.textContent = `Found ${sha1s.length} entries. Resolving projects…`;
-    setBar(1, 5);
+    setBar(1, 6);
 
     // Step 2: hashes -> versions
     setPhase("Resolving versions from hashes…");
@@ -252,7 +278,7 @@ class Modpack {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ hashes: sha1s, algorithm: "sha1" })
     }).then(r => r.json());
-    setBar(2, 5);
+    setBar(2, 6);
 
     // Step 3: collapse to unique projects and detect category, and remember original file obj per project
     setPhase("Collapsing to projects…");
@@ -273,16 +299,11 @@ class Modpack {
     if (!projectIds.length) {
       setPhase("Done"); detail.textContent = "No projects resolved."; outRaw.textContent = JSON.stringify(versionMap, null, 2); return null;
     }
-    setBar(3, 5);
+    setBar(3, 6);
 
     // Helpers
     function loaderForCategory(cat) {
       return (cat === "resourcepack" || cat === "shaderpack") ? "minecraft" : packLoader;
-    }
-    async function getProject(projectId) {
-      const r = await fetch(`https://api.modrinth.com/v2/project/${projectId}`);
-      if (!r.ok) return null;
-      return r.json();
     }
 
 
@@ -306,6 +327,9 @@ class Modpack {
     }
 
     // Step 4: fetch project info + best target version, with progress (+ Carpet fallback only if Modrinth missing)
+    setPhase("Fetching project metadata…");
+    const projectMap = await getProjectsBatch(projectIds);
+    setBar(4, 6);
     setPhase("Checking target availability…", `0 / ${projectIds.length}`);
     const rows = await mapLimitProgress(
       projectIds,
@@ -314,10 +338,8 @@ class Modpack {
         const rep = projectEntries.get(pid)?.anyVersion;
         const cat = projectEntries.get(pid)?.category || "mod";
         const loader = loaderForCategory(cat);
-        const [proj, bestModrinth] = await Promise.all([
-          getProject(pid),
-          getBestTargetVersion(pid, targetMc, loader, rep?.name)
-        ]);
+        const proj = projectMap.get(pid);
+        const bestModrinth = await getBestTargetVersion(pid, targetMc, loader, rep?.name);
 
         let best = bestModrinth;
         let source = proj ? "modrinth" : "none";
@@ -368,9 +390,9 @@ class Modpack {
       },
       (done, total) => {
         setPhase("Checking target availability…", `${done} / ${total}`);
-        const stepBase = 3;
+        const stepBase = 4;
         const stepWidth = done / total;
-        setBar(stepBase + stepWidth, 5);
+        setBar(stepBase + stepWidth, 6);
       }
     );
 
