@@ -7,6 +7,7 @@ const runBtn = $("run");
 const buildBtn = $("build");
 const buildControls = $("build-controls");
 const captureMissingBtn = $("capture-missing");
+const downloadMissingBtn = $("download-missing");
 const dlLink = $("downloadLink");
 const buildNote = $("buildNote");
 
@@ -769,6 +770,36 @@ class MissingItemsManager {
     return item;
   }
 
+  downloadMissingItems(items, modpackName) {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error("There are no missing items to download.");
+    }
+
+    const names = items.map(item => {
+      const name = [item?.name, item?.slug, item?.project_id]
+        .find(value => typeof value === "string" && value.trim());
+      return (name || "(unknown)")
+        .replace(/[\u0000-\u001f\u007f]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    });
+    const filenameBase = slugify(modpackName || "modpack") || "modpack";
+    const blob = new Blob([names.join("\n")], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${filenameBase}-missing-items.txt`;
+    link.hidden = true;
+    document.body.appendChild(link);
+
+    try {
+      link.click();
+    } finally {
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+  }
+
   async removeMissingItem(id) {
     // This method doesn't need to be async since it doesn't read data
     const data = await this.getMissingItems();
@@ -1242,6 +1273,8 @@ runBtn.addEventListener("click", async () => {
   buildBtn.disabled = true;
   captureMissingBtn.disabled = true;
   captureMissingBtn.style.display = "none";
+  downloadMissingBtn.disabled = true;
+  downloadMissingBtn.style.display = "none";
   dlLink.style.display = "none";
   buildNote.textContent = "";
 
@@ -1269,8 +1302,11 @@ runBtn.addEventListener("click", async () => {
       captureMissingBtn.disabled = false;
       captureMissingBtn.style.display = "inline-block";
       captureMissingBtn.textContent = `Remember ${missingItems.length} missing item${missingItems.length > 1 ? 's' : ''}`;
+      downloadMissingBtn.disabled = false;
+      downloadMissingBtn.style.display = "inline-block";
     } else {
       captureMissingBtn.style.display = "none";
+      downloadMissingBtn.style.display = "none";
     }
   } catch (err) {
     console.error(err);
@@ -1390,6 +1426,22 @@ captureMissingBtn.addEventListener("click", async () => {
 
   showNotification(message);
   missingItemsManager.updateMissingItemsButtonTitle();
+});
+
+downloadMissingBtn.addEventListener("click", () => {
+  const missingItems = currentModpack.getMissingItems();
+  if (missingItems.length === 0) {
+    showNotification("No missing items to download.");
+    return;
+  }
+
+  try {
+    missingItemsManager.downloadMissingItems(missingItems, currentModpack.packName);
+    showNotification(`Downloaded ${missingItems.length} missing item name${missingItems.length === 1 ? "" : "s"}.`);
+  } catch (err) {
+    console.error("Failed to download missing items:", err);
+    showNotification("Could not download missing items. Please try again.");
+  }
 });
 
 // Check missing items on page load if any exist

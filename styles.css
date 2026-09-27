@@ -89,18 +89,18 @@ button { cursor: pointer; }
 button:hover { filter: brightness(1.03); }
 
 /* Primary action buttons (Check and Build) */
-#run, #build {
+#run, #build, #download-missing {
   background: var(--badge-modrinth-bg);
   border-color: var(--badge-modrinth-br);
   color: var(--badge-modrinth-fg);
   font-weight: 500;
 }
 
-#run:hover, #build:hover {
+#run:hover, #build:hover, #download-missing:hover {
   filter: brightness(1.1);
 }
 
-#run:disabled, #build:disabled {
+#run:disabled, #build:disabled, #download-missing:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   filter: none;
